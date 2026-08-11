@@ -2,6 +2,10 @@ cfg_if::cfg_if! {
     if #[cfg(target_os="linux")] {
         pub const WORKING_DIR: &str = "/run/garnd";
         pub const WELCOME_SOCK_NAME: &str = "welcome.sock";
+        pub const USER_NAME: &str = "garnd";
+        pub const GROUP_NAME: &str = "garnd";
+        pub const SHM_FILE_NAME: &str = "shm";
+        #[cfg(miri)] pub const PAGE_SIZE: usize = 4096;
     }
 }
 
