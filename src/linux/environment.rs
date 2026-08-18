@@ -8,7 +8,6 @@ use std::sync::mpsc::Sender;
 use garnshared::constants::ENVIRONMENT_REQUEST_SIZE;
 use garnshared::environment_protocol::{EnvironmentRequest, EnvironmentResponse};
 use garnshared::linux::pthread_mutex::PthreadMutex;
-use hashed_type_def::HashedTypeMethods;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use nix::sys::eventfd::EventFd;
 use nix::sys::socket::{recv, MsgFlags, send, ControlMessage, sendmsg};
