@@ -13,3 +13,11 @@ pub fn get_optional_env_var(name: &str) -> Option<String> {
 pub fn warn(msg: &str) {
     eprintln!("garnd: WARNING! {msg}");
 }
+
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<?>")
+}

@@ -1,4 +1,6 @@
 pub mod runtime;
-pub mod shm_allocator;
 mod runtime_error;
+mod shm_allocator;
 mod miri;
+mod environment;
+mod welcome_thread;

@@ -1,42 +1,53 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
 use crate::util::warn;
-use libc::off_t;
+use nix::libc::off_t;
 use nix::fcntl::{FcntlArg, SealFlag};
 use nix::sys::memfd::MFdFlags;
 use nix::sys::mman::{MapFlags, ProtFlags};
 use nix::unistd::SysconfVar;
-use std::any::TypeId;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 use std::num::NonZero;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::panic::{catch_unwind, UnwindSafe, resume_unwind};
 use std::ptr::NonNull;
-use super::miri::{AsFd, fcntl, memfd_create, ftruncate, sysconf, mmap, munmap};
+use garnshared::linux::traits::ShmSync;
+use hashed_type_def::HashedTypeMethods;
+use uuid::Uuid;
+use super::miri::{AsFd, BorrowedFd, fcntl, memfd_create, ftruncate, sysconf, mmap, munmap};
 
-/// Types for which it is safe to share references between processes.
-pub unsafe trait ShmSync: Sync + 'static {}
+pub struct ClientResourceLocation {
+    pub page: usize,
+    pub offset: usize,
+    pub fd: RawFd
+}
 
 struct ResourceMetadata {
-    type_id: TypeId,
+    type_id: Uuid,
     page: usize,
     offset: usize,
     destructor: Box<dyn FnOnce(*mut u8) + UnwindSafe>,
 }
 
+struct Page {
+    fd: OwnedFd,
+    mem: NonNull<u8>,
+}
+
 pub struct ShmAllocator {
     resources: HashMap<String, ResourceMetadata>,
     page_size: usize,
-    pages: Vec<NonNull<u8>>,
+    pages: Vec<Page>,
     free_ptr: usize,
 }
 
 impl ShmAllocator {
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub fn new() -> Result<Self, Box<dyn Error + Send>> {
         let page_size = match sysconf(SysconfVar::PAGE_SIZE) {
             Ok(Some(0) | None) => return Err(Box::new(RuntimeError::GetPageSizeFailed)),
-            Ok(Some(res)) => usize::try_from(res)?, // non-negative according to the Linux kernel
+            Ok(Some(res)) => usize::try_from(res).unwrap(), // non-negative according to the Linux kernel
             Err(e) => return Err(Box::new(e)),
         };
 
@@ -52,7 +63,7 @@ impl ShmAllocator {
         &mut self,
         name: &str,
         resource: T,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<ClientResourceLocation, Box<dyn Error + Send>> {
         if self.resources.contains_key(name) {
             return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse));
         }
@@ -88,6 +99,7 @@ impl ShmAllocator {
             self.pages
                 .last()
                 .unwrap()
+                .mem
                 .as_ptr()
                 .add(aligned_free_ptr)
         }
@@ -101,7 +113,7 @@ impl ShmAllocator {
         self.resources.insert(
             name.to_string(),
             ResourceMetadata {
-                type_id: TypeId::of::<T>(),
+                type_id: T::type_uuid(),
                 page: self.pages.len() - 1,
                 offset: aligned_free_ptr,
                 destructor: Box::new(move |ptr| {
@@ -113,14 +125,18 @@ impl ShmAllocator {
             },
         );
 
-        Ok(())
+        Ok(ClientResourceLocation {
+            page: self.pages.len() - 1,
+            offset: aligned_free_ptr,
+            fd: self.pages.last().unwrap().fd.as_raw_fd()
+        })
     }
 
-    pub fn access_resource<T: ShmSync>(&self, name: &str) -> Result<&T, Box<dyn Error>> {
+    pub fn access_resource<'a, T: ShmSync>(&'a self, name: &str) -> Result<&'a T, Box<dyn Error>> {
         let Some(resource_metadata) = self.resources.get(name) else {
             return Err(Box::new(RuntimeError::ResourceNotFound));
         };
-        if resource_metadata.type_id != TypeId::of::<T>() {
+        if resource_metadata.type_id != T::type_uuid() {
             return Err(Box::new(RuntimeError::ResourceTypeMismatch));
         }
         // SAFETY: raw pointer dereference: alignment is guaranteed by move_into_shm,
@@ -128,18 +144,20 @@ impl ShmAllocator {
         // valid type is guaranteed by last if-clause,
         // no mutable references exist (because it is impossible to acquire one)
         // and safe Rust guarantees that this references will not be mutated.
+        // Since there is no way to deallocate or modify a resource, the reference is valid for as
+        // long as self is alive.
         // add: offset fits into isize, because the upper half of addresses is reserved for kernel space and
         // the whole range between the original address and the offset address belongs to the same
         // allocation (anonymous file). The address does also not wrap around the address space,
         // because the whole file is guaranteed to be in the lower half of the address space.
         Ok(unsafe {
-            &*self.pages[resource_metadata.page].as_ptr()
+            &*self.pages[resource_metadata.page].mem.as_ptr()
                 .add(resource_metadata.offset)
                 .cast::<T>()
         })
     }
 
-    fn create_new_page(&mut self) -> Result<(), Box<dyn Error>> {
+    fn create_new_page(&mut self) -> Result<(), Box<dyn Error + Send>> {
         let shm_fd = match memfd_create(
             constants::SHM_FILE_NAME,
             MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
@@ -148,7 +166,7 @@ impl ShmAllocator {
             Err(e) => return Err(Box::new(e)),
         };
 
-        if let Err(e) = ftruncate(shm_fd.as_fd(), off_t::try_from(self.page_size)? /* definitely valid */) {
+        if let Err(e) = ftruncate(shm_fd.as_fd(), off_t::try_from(self.page_size).unwrap()) {
             return Err(Box::new(e));
         }
 
@@ -176,7 +194,10 @@ impl ShmAllocator {
             )
         } {
             Ok(res) => {
-                self.pages.push(res.cast::<u8>());
+                self.pages.push(Page {
+                    fd: shm_fd,
+                    mem: res.cast::<u8>(),
+                });
             }
             Err(e) => return Err(Box::new(e)),
         }
@@ -213,6 +234,7 @@ impl Drop for ShmAllocator {
                     // because the whole file is guaranteed to be in the lower half of the address space.
                     unsafe {
                         self.pages[resource_metadata.page]
+                            .mem
                             .as_ptr()
                             .add(resource_metadata.offset)
                     },
@@ -224,12 +246,16 @@ impl Drop for ShmAllocator {
         for page in &self.pages {
             // SAFETY: addr being a multiple of the page size is guaranteed by mmap, which
             // aligns the memory to page boundaries
-            if let Err(e) = unsafe { munmap(page.cast::<c_void>(), self.page_size) } {
+            if let Err(e) = unsafe { munmap(page.mem.cast::<c_void>(), self.page_size) } {
                 warn(format!("unmapping of shared memory failed: {}", e).as_str());
             }
         }
         if let Some(first_panic) = first_panic {
-            resume_unwind(first_panic);
+            if std::thread::panicking() {
+                warn("ShmAllocator panicked while destructing");
+            } else {
+                resume_unwind(first_panic);
+            }
         }
     }
 }

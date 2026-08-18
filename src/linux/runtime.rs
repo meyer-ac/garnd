@@ -1,43 +1,50 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
-use crate::util::warn;
+use crate::linux::welcome_thread;
+use crate::util::{panic_message, warn};
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
+use nix::errno::Errno as NixErrno;
 use nix::libc;
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::prctl::get_no_new_privs;
+use nix::sys::socket::sockopt::PassCred;
+use nix::sys::socket::{
+    AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket,
+};
 use nix::unistd::{
     Gid, Uid, User, getgroups, getresgid, getresuid, setegid, seteuid, setfsgid, setfsuid, setgid,
     setuid,
 };
 use std::error::Error;
-use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
 
 pub struct Runtime<S: State> {
-    _state: PhantomData<S>,
-    tx: mpsc::Sender<RuntimeError>,
+    error_tx: Sender<Box<dyn Error + Send>>,
     working_dir_path: PathBuf,
-    welcome_sock_rel_path: PathBuf,
-    welcome_thread: Option<JoinHandle<()>>,
+    state_data: S,
 }
 
 impl Runtime<Uninit> {
-    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<RuntimeError>) {
-        let (tx, rx) = mpsc::channel::<RuntimeError>();
+    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<Box<dyn Error + Send>>) {
+        let (tx, rx) = mpsc::channel::<Box<dyn Error + Send>>();
         let working_dir_path =
-            Path::new(working_dir_name.unwrap_or(constants::WORKING_DIR)).to_path_buf();
-        let welcome_sock_rel_path = Path::new(constants::WELCOME_SOCK_NAME).to_path_buf();
+            Path::new(working_dir_name.unwrap_or(garnshared::constants::WORKING_DIR)).to_path_buf();
+        let welcome_sock_rel_path =
+            Path::new(garnshared::constants::WELCOME_SOCK_FILE_NAME).to_path_buf();
 
         (
             Self {
-                _state: PhantomData,
-                tx,
+                error_tx: tx,
                 working_dir_path,
-                welcome_sock_rel_path,
-                welcome_thread: None,
+                state_data: Uninit {},
             },
             rx,
         )
@@ -46,12 +53,15 @@ impl Runtime<Uninit> {
     pub fn init(self) -> Result<Runtime<Ready>, Box<dyn Error>> {
         Self::check_privileges()?;
 
+        let (welcome_socket, shutdown_event) = Self::setup_socket()?;
+
         Ok(Runtime {
-            _state: PhantomData,
-            tx: self.tx,
+            error_tx: self.error_tx,
             working_dir_path: self.working_dir_path,
-            welcome_sock_rel_path: self.welcome_sock_rel_path,
-            welcome_thread: None,
+            state_data: Ready {
+                welcome_socket,
+                shutdown_event: Arc::new(shutdown_event),
+            },
         })
     }
 
@@ -181,34 +191,110 @@ impl Runtime<Uninit> {
 
         Ok(())
     }
+
+    fn setup_socket() -> Result<(OwnedFd, EventFd), Box<dyn Error>> {
+        let welcome_socket = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        ).map_err(Box::new)?;
+
+        // todo: re-evaluate if this is neccessary
+        if let Err(e) = setsockopt(&welcome_socket.as_fd(), PassCred, &true) {
+            return Err(Box::new(e));
+        }
+
+        let welcome_sock_name = String::from_iter(
+            [
+                garnshared::constants::ABSTRACT_SOCK_NAME_PREFIX,
+                garnshared::constants::WELCOME_SOCK_ABSTRACT_NAME,
+            ]
+            .into_iter(),
+        );
+        let addr = match UnixAddr::new_abstract(welcome_sock_name.as_bytes()) {
+            Ok(res) => res,
+            Err(e) => return Err(Box::new(e)),
+        };
+
+        if let Err(e) = bind(welcome_socket.as_raw_fd(), &addr) {
+            return match e {
+                NixErrno::EADDRINUSE => Err(Box::new(RuntimeError::ServiceAlreadyRunning)),
+                e => Err(Box::new(e)),
+            };
+        }
+
+        let shutdown_event = match EventFd::from_value_and_flags(
+            0,
+            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+        ) {
+            Ok(res) => res,
+            Err(e) => return Err(Box::new(e)),
+        };
+
+        Ok((welcome_socket, shutdown_event))
+    }
 }
 
 impl Runtime<Ready> {
     pub fn listen(self) -> Runtime<Listening> {
-        let welcome_sock_path = self
-            .working_dir_path
-            .join(self.welcome_sock_rel_path.as_path());
-        let thread_tx = self.tx.clone();
-        let welcome_thread = thread::spawn(move || {
-            let welcome_sock_path = welcome_sock_path;
-            let tx = thread_tx;
-        });
+        // Ownership of the socket is moved into the thread and handed back once the threads join.
+        let error_tx = self.error_tx.clone();
+        let welcome_socket = self.state_data.welcome_socket;
+        let shutdown_event = Arc::clone(&self.state_data.shutdown_event);
+        let welcome_thread = ManuallyDrop::new(thread::spawn(move || {
+            welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
+        }));
 
         Runtime {
-            _state: PhantomData,
-            tx: self.tx,
+            error_tx: self.error_tx,
             working_dir_path: self.working_dir_path,
-            welcome_sock_rel_path: self.welcome_sock_rel_path,
-            welcome_thread: None,
+            state_data: Listening {
+                welcome_thread,
+                shutdown_event: self.state_data.shutdown_event,
+            },
         }
     }
 }
 
 pub trait State {}
-pub enum Uninit {}
-pub enum Ready {}
-pub enum Listening {}
+pub struct Uninit {}
+pub struct Ready {
+    welcome_socket: OwnedFd,
+    shutdown_event: Arc<EventFd>,
+}
+pub struct Listening {
+    welcome_thread: ManuallyDrop<JoinHandle<Option<OwnedFd>>>,
+    shutdown_event: Arc<EventFd>,
+}
 
 impl State for Uninit {}
 impl State for Ready {}
 impl State for Listening {}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        if let Err(e) = self.shutdown_event.write(1) {
+            if thread::panicking() {
+                warn(format!("signaling welcome thread failed: {}", e.to_string()).as_str());
+                return;
+            } else {
+                Err::<usize, nix::errno::Errno>(e).unwrap();
+            }
+        }
+        // SAFETY: The field is not accessed after this called, because the lifetime of the
+        // whole Runtime object ends here.
+        match unsafe { ManuallyDrop::take(&mut self.welcome_thread) }.join() {
+            Ok(welcome_socket) => {
+                welcome_socket.map(drop);
+            }
+            Err(e) => {
+                if thread::panicking() {
+                    warn(format!("welcome thread panicked: {}", panic_message(&e)).as_str());
+                } else {
+                    resume_unwind(e);
+                }
+            }
+        }
+    }
+}
