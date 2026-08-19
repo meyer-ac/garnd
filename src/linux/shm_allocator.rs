@@ -18,6 +18,7 @@ use hashed_type_def::HashedTypeMethods;
 use uuid::Uuid;
 use super::miri::{AsFd, BorrowedFd, fcntl, memfd_create, ftruncate, sysconf, mmap, munmap};
 
+#[derive(Copy, Clone)]
 pub struct ClientResourceLocation {
     pub page: usize,
     pub offset: usize,
@@ -132,13 +133,24 @@ impl ShmAllocator {
         })
     }
 
-    pub fn access_resource<'a, T: ShmSync>(&'a self, name: &str) -> Result<&'a T, Box<dyn Error>> {
+    pub fn find_resource<T: ShmSync>(&self, name: &str) -> Result<Option<ClientResourceLocation>, Box<dyn Error + Send>> {
         let Some(resource_metadata) = self.resources.get(name) else {
-            return Err(Box::new(RuntimeError::ResourceNotFound));
+            return Ok(None);
         };
         if resource_metadata.type_id != T::type_uuid() {
             return Err(Box::new(RuntimeError::ResourceTypeMismatch));
         }
+        Ok(Some(ClientResourceLocation {
+            page: resource_metadata.page,
+            offset: resource_metadata.offset,
+            fd: self.pages[resource_metadata.page].fd.as_raw_fd(),
+        }))
+    }
+
+    pub fn access_resource<'a, T: ShmSync>(&'a self, name: &str) -> Result<Option<&'a T>, Box<dyn Error + Send>> {
+        let Some(loc) = self.find_resource::<T>(name)? else {
+            return Ok(None);
+        };
         // SAFETY: raw pointer dereference: alignment is guaranteed by move_into_shm,
         // non-null and dereferenceable is guaranteed by mmap,
         // valid type is guaranteed by last if-clause,
@@ -150,11 +162,11 @@ impl ShmAllocator {
         // the whole range between the original address and the offset address belongs to the same
         // allocation (anonymous file). The address does also not wrap around the address space,
         // because the whole file is guaranteed to be in the lower half of the address space.
-        Ok(unsafe {
-            &*self.pages[resource_metadata.page].mem.as_ptr()
-                .add(resource_metadata.offset)
+        Ok(Some(unsafe {
+            &*self.pages[loc.page].mem.as_ptr()
+                .add(loc.offset)
                 .cast::<T>()
-        })
+        }))
     }
 
     fn create_new_page(&mut self) -> Result<(), Box<dyn Error + Send>> {

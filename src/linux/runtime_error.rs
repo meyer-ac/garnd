@@ -19,7 +19,6 @@ pub enum RuntimeError {
     ResourceNameAlreadyInUse,
     ResourceAlignmentLargerThanPage,
     ResourceTooLargeForPage,
-    ResourceNotFound,
     ResourceTypeMismatch
 }
 
@@ -40,7 +39,6 @@ impl fmt::Display for RuntimeError {
             Self::ResourceNameAlreadyInUse => write!(f, "a resource with the same name already exists"),
             Self::ResourceAlignmentLargerThanPage => write!(f, "tried to move a resource into share memory whose alignment is larger than the page size"),
             Self::ResourceTooLargeForPage => write!(f, "tried to move a resource into shared memory which is larger than a whole page"),
-            Self::ResourceNotFound => write!(f, "tried to access a non-existent resource"),
             Self::ResourceTypeMismatch => write!(f, "tried to access a resource of the wrong type"),
         }
     }
