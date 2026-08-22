@@ -21,3 +21,28 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("<?>")
 }
+
+#[macro_export]
+macro_rules! send_boxed_error {
+    ($error_tx:expr, $err:expr) => {
+        if $error_tx.send($err).is_err() {
+            panic!("Error propagation channel broke down unexpectedly.")
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! send_error {
+    ($error_tx:expr, $err:expr) => {
+        $crate::send_boxed_error!($error_tx, Box::new($err))
+    }
+}
+
+#[macro_export]
+macro_rules! send_all_errors {
+    ($error_tx:expr, $errs:expr) => {
+        for err in $errs {
+            $crate::send_boxed_error!($error_tx, err)
+        }
+    }
+}

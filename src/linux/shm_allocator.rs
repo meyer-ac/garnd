@@ -7,16 +7,16 @@ use nix::sys::memfd::MFdFlags;
 use nix::sys::mman::{MapFlags, ProtFlags};
 use nix::unistd::SysconfVar;
 use std::collections::HashMap;
-use std::error::Error;
 use std::ffi::c_void;
 use std::num::NonZero;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::panic::{catch_unwind, UnwindSafe, resume_unwind};
 use std::ptr::NonNull;
+use garnshared::error_types::SendableError;
 use garnshared::linux::traits::ShmSync;
 use hashed_type_def::HashedTypeMethods;
 use uuid::Uuid;
-use super::miri::{AsFd, BorrowedFd, fcntl, memfd_create, ftruncate, sysconf, mmap, munmap};
+use super::miri::{AsFd, fcntl, memfd_create, ftruncate, sysconf, mmap, munmap};
 
 #[derive(Copy, Clone)]
 pub struct ClientResourceLocation {
@@ -45,7 +45,7 @@ pub struct ShmAllocator {
 }
 
 impl ShmAllocator {
-    pub fn new() -> Result<Self, Box<dyn Error + Send>> {
+    pub fn new() -> Result<Self, SendableError> {
         let page_size = match sysconf(SysconfVar::PAGE_SIZE) {
             Ok(Some(0) | None) => return Err(Box::new(RuntimeError::GetPageSizeFailed)),
             Ok(Some(res)) => usize::try_from(res).unwrap(), // non-negative according to the Linux kernel
@@ -64,7 +64,7 @@ impl ShmAllocator {
         &mut self,
         name: &str,
         resource: T,
-    ) -> Result<ClientResourceLocation, Box<dyn Error + Send>> {
+    ) -> Result<ClientResourceLocation, SendableError> {
         if self.resources.contains_key(name) {
             return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse));
         }
@@ -133,7 +133,7 @@ impl ShmAllocator {
         })
     }
 
-    pub fn find_resource<T: ShmSync>(&self, name: &str) -> Result<Option<ClientResourceLocation>, Box<dyn Error + Send>> {
+    pub fn find_resource<T: ShmSync>(&self, name: &str) -> Result<Option<ClientResourceLocation>, SendableError> {
         let Some(resource_metadata) = self.resources.get(name) else {
             return Ok(None);
         };
@@ -147,7 +147,7 @@ impl ShmAllocator {
         }))
     }
 
-    pub fn access_resource<'a, T: ShmSync>(&'a self, name: &str) -> Result<Option<&'a T>, Box<dyn Error + Send>> {
+    pub fn access_resource<T: ShmSync>(&self, name: &str) -> Result<Option<&T>, SendableError> {
         let Some(loc) = self.find_resource::<T>(name)? else {
             return Ok(None);
         };
@@ -169,7 +169,7 @@ impl ShmAllocator {
         }))
     }
 
-    fn create_new_page(&mut self) -> Result<(), Box<dyn Error + Send>> {
+    fn create_new_page(&mut self) -> Result<(), SendableError> {
         let shm_fd = match memfd_create(
             constants::SHM_FILE_NAME,
             MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,

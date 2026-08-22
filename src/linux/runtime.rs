@@ -1,7 +1,7 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
 use crate::linux::welcome_thread;
-use crate::util::{panic_message, warn};
+use crate::util::warn;
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
 use nix::errno::Errno as NixErrno;
@@ -17,28 +17,25 @@ use nix::unistd::{
     setuid,
 };
 use std::error::Error;
-use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
+use garnshared::error_types::SendableError;
 
 pub struct Runtime<S: State> {
-    error_tx: Sender<Box<dyn Error + Send>>,
+    error_tx: Sender<SendableError>,
     working_dir_path: PathBuf,
     state_data: S,
 }
 
 impl Runtime<Uninit> {
-    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<Box<dyn Error + Send>>) {
-        let (tx, rx) = mpsc::channel::<Box<dyn Error + Send>>();
+    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<SendableError>) {
+        let (tx, rx) = mpsc::channel::<SendableError>();
         let working_dir_path =
             Path::new(working_dir_name.unwrap_or(garnshared::constants::WORKING_DIR)).to_path_buf();
-        let welcome_sock_rel_path =
-            Path::new(garnshared::constants::WELCOME_SOCK_FILE_NAME).to_path_buf();
 
         (
             Self {
@@ -50,7 +47,7 @@ impl Runtime<Uninit> {
         )
     }
 
-    pub fn init(self) -> Result<Runtime<Ready>, Box<dyn Error>> {
+    pub fn init(self) -> Result<Runtime<Ready>, SendableError> {
         Self::check_privileges()?;
 
         let (welcome_socket, shutdown_event) = Self::setup_socket()?;
@@ -66,7 +63,7 @@ impl Runtime<Uninit> {
     }
 
     #[allow(clippy::similar_names)] // uid and gid being similar is fine
-    fn check_privileges() -> Result<(), Box<dyn Error>> {
+    fn check_privileges() -> Result<(), SendableError> {
         cfg_if! {
             if #[cfg(debug_assertions)] {
                 warn("privilege checks are disabled in debug mode");
@@ -74,16 +71,9 @@ impl Runtime<Uninit> {
             }
         }
         #[allow(unreachable_code)] // Only unreachable in debug mode, which is intended
-        let garn_user = match User::from_name(constants::USER_NAME) {
-            Ok(Some(res)) => res,
-            Ok(None) => return Err(Box::new(RuntimeError::UserNonexistent)),
-            Err(e) => return Err(Box::new(e)),
-        };
+        let garn_user = User::from_name(constants::USER_NAME)?.ok_or(Box::new(RuntimeError::UserNonexistent))?;
 
-        let res_uid = match getresuid() {
-            Ok(res) => res,
-            Err(e) => return Err(Box::new(e)),
-        };
+        let res_uid = getresuid()?;
         if res_uid.real != garn_user.uid
             || res_uid.effective != garn_user.uid
             || res_uid.saved != garn_user.uid
@@ -94,10 +84,7 @@ impl Runtime<Uninit> {
             return Err(Box::new(RuntimeError::RunAsWrongUser));
         }
 
-        let res_gid = match getresgid() {
-            Ok(res) => res,
-            Err(e) => return Err(Box::new(e)),
-        };
+        let res_gid = getresgid()?;
         if res_gid.real != garn_user.gid
             || res_gid.effective != garn_user.gid
             || res_gid.saved != garn_user.gid
@@ -107,30 +94,21 @@ impl Runtime<Uninit> {
         if setfsgid(Gid::from_raw(u32::MAX)) != garn_user.gid {
             return Err(Box::new(RuntimeError::RunAsWrongGroup));
         }
-        let groups = match getgroups() {
-            Ok(res) => res,
-            Err(e) => return Err(Box::new(e)),
-        };
+        let groups = getgroups()?;
         if groups.contains(&Gid::from_raw(0)) {
             return Err(Box::new(RuntimeError::RunWithRootGroup));
         }
 
         for cap in caps::all().iter() {
             for cap_set in [caps::CapSet::Permitted, caps::CapSet::Bounding].iter() {
-                let has_cap = match caps::has_cap(None, *cap_set, *cap) {
-                    Ok(res) => res,
-                    Err(e) => return Err(Box::new(e)),
-                };
+                let has_cap = caps::has_cap(None, *cap_set, *cap)?;
                 if has_cap {
                     return Err(Box::new(RuntimeError::RunWithCapabilities));
                 }
             }
         }
 
-        let no_new_privs = match get_no_new_privs() {
-            Ok(res) => res,
-            Err(e) => return Err(Box::new(e)),
-        };
+        let no_new_privs = get_no_new_privs()?;
         if !no_new_privs {
             return Err(Box::new(RuntimeError::MayObtainNewPrivileges));
         }
@@ -192,15 +170,15 @@ impl Runtime<Uninit> {
         Ok(())
     }
 
-    fn setup_socket() -> Result<(OwnedFd, EventFd), Box<dyn Error>> {
+    fn setup_socket() -> Result<(OwnedFd, EventFd), SendableError> {
         let welcome_socket = socket(
             AddressFamily::Unix,
             SockType::SeqPacket,
             SockFlag::SOCK_CLOEXEC,
             None,
-        ).map_err(Box::new)?;
+        )?;
 
-        // todo: re-evaluate if this is neccessary
+        // todo: re-evaluate if this is necessary
         if let Err(e) = setsockopt(&welcome_socket.as_fd(), PassCred, &true) {
             return Err(Box::new(e));
         }
@@ -242,9 +220,9 @@ impl Runtime<Ready> {
         let error_tx = self.error_tx.clone();
         let welcome_socket = self.state_data.welcome_socket;
         let shutdown_event = Arc::clone(&self.state_data.shutdown_event);
-        let welcome_thread = ManuallyDrop::new(thread::spawn(move || {
+        let welcome_thread = thread::spawn(move || {
             welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
-        }));
+        });
 
         Runtime {
             error_tx: self.error_tx,
@@ -264,7 +242,7 @@ pub struct Ready {
     shutdown_event: Arc<EventFd>,
 }
 pub struct Listening {
-    welcome_thread: ManuallyDrop<JoinHandle<Option<OwnedFd>>>,
+    welcome_thread: JoinHandle<()>,
     shutdown_event: Arc<EventFd>,
 }
 
@@ -280,20 +258,6 @@ impl Drop for Listening {
                 return;
             } else {
                 Err::<usize, nix::errno::Errno>(e).unwrap();
-            }
-        }
-        // SAFETY: The field is not accessed after this called, because the lifetime of the
-        // whole Runtime object ends here.
-        match unsafe { ManuallyDrop::take(&mut self.welcome_thread) }.join() {
-            Ok(welcome_socket) => {
-                welcome_socket.map(drop);
-            }
-            Err(e) => {
-                if thread::panicking() {
-                    warn(format!("welcome thread panicked: {}", panic_message(&e)).as_str());
-                } else {
-                    resume_unwind(e);
-                }
             }
         }
     }
