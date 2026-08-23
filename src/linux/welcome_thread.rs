@@ -1,5 +1,7 @@
 use crate::linux::environment::Environment;
 use crate::linux::runtime_error::RuntimeError;
+use crate::linux::util::unwrap_or_report_failure;
+use crate::shutdown_signal::ShutdownSignal;
 use crate::{send_all_errors, send_error};
 use garnshared::constants::WELCOME_REQUEST_SIZE;
 use garnshared::error_types::SendableError;
@@ -36,8 +38,6 @@ pub fn welcome_thread_main(
     // so that the owner (this thread) can remove the environment
     let (close_env_tx, close_env_rx) = mpsc::channel::<String>();
 
-    // todo: proper error handling
-
     if let Err(e) = listen(&welcome_socket.as_fd(), Backlog::MAXCONN) {
         send_error!(error_tx, e);
         return;
@@ -65,6 +65,7 @@ pub fn welcome_thread_main(
                 .read()
                 .map(|_| ())
                 .unwrap_or_else(|e| send_error!(error_tx, e));
+            send_error!(error_tx, ShutdownSignal {});
             return;
         }
 
@@ -91,7 +92,8 @@ pub fn welcome_thread_main(
         // Did the welcome socket break down for some reason?
         if !poll_welcome.revents().unwrap().contains(PollFlags::POLLIN) {
             send_error!(error_tx, RuntimeError::WelcomeSocketFailed);
-            return; // todo: panic here?
+            // We can't possibly recover from this failure => shutdown
+            send_error!(error_tx, ShutdownSignal {});
         }
 
         let (client_fd, request) = match receive_and_parse_request(welcome_socket.as_fd()) {
@@ -128,7 +130,7 @@ fn receive_and_parse_request(
     let mut buffer: [u8; WELCOME_REQUEST_SIZE] = [0; WELCOME_REQUEST_SIZE];
     recv(raw_fd, &mut buffer, MsgFlags::empty())?;
 
-    let Ok(request_str) = String::from_utf8(buffer.to_vec()) else {
+    let Ok(request_str) = str::from_utf8(&buffer) else {
         let response = WelcomeResponse::MalformedRequest.serialize();
         send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
         return Err(None);
@@ -151,42 +153,46 @@ fn handle_open_environment(
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
 ) -> Result<(), Vec<SendableError>> {
-    let raw_fd = client_fd.as_raw_fd();
-    let infallible_open_action: Box<dyn FnOnce()>;
+    let passed_off_fd = unwrap_or_report_failure!(
+        nix::unistd::dup(client_fd.as_fd()),
+        client_fd.as_raw_fd(),
+        WelcomeResponse,
+        Box::new
+    );
     match environments.entry(env_name.clone()) {
         Entry::Vacant(entry) => {
-            match Environment::new(
-                &env_name,
-                client_fd,
-                error_tx.clone(),
-                close_env_event.clone(),
-                close_env_tx.clone(),
-            ) {
-                Ok(res) => {
-                    infallible_open_action = Box::new(move || {
-                        entry.insert(res);
-                    });
-                }
-                Err(e) => {
-                    let mut errors = vec![e];
-                    let response = WelcomeResponse::InternalError.serialize();
-                    if let Err(e) = send(raw_fd, response.as_bytes(), MsgFlags::empty()) {
-                        errors.push(Box::new(e));
-                    }
-                    return Err(errors);
-                }
-            }
+            let mut res = unwrap_or_report_failure!(
+                Environment::new(
+                    &env_name,
+                    error_tx.clone(),
+                    close_env_event.clone(),
+                    close_env_tx.clone(),
+                ),
+                client_fd.as_raw_fd(),
+                WelcomeResponse
+            );
+            unwrap_or_report_failure!(
+                res.insert_socket(passed_off_fd),
+                client_fd.as_raw_fd(),
+                WelcomeResponse
+            );
+            entry.insert(res);
         }
         Entry::Occupied(mut entry) => {
-            infallible_open_action = Box::new(move || {
-                entry.get_mut().insert_socket(client_fd);
-            });
+            unwrap_or_report_failure!(
+                entry.get_mut().insert_socket(passed_off_fd),
+                client_fd.as_raw_fd(),
+                WelcomeResponse
+            );
         }
     }
     let response = WelcomeResponse::OpenEnvironmentOk.serialize();
-    if let Err(e) = send(raw_fd, response.as_bytes(), MsgFlags::empty()) {
+    if let Err(e) = send(
+        client_fd.as_raw_fd(),
+        response.as_bytes(),
+        MsgFlags::empty(),
+    ) {
         return Err(vec![Box::new(e)]);
     }
-    infallible_open_action();
     Ok(())
 }

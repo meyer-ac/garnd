@@ -9,21 +9,28 @@ use nix::libc;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::prctl::get_no_new_privs;
 use nix::sys::socket::sockopt::PassCred;
-use nix::sys::socket::{
-    AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket,
-};
+use nix::sys::socket::{bind, setsockopt, socket, AddressFamily, SockFlag, SockType, UnixAddr};
 use nix::unistd::{
     Gid, Uid, User, getgroups, getresgid, getresuid, setegid, seteuid, setfsgid, setfsuid, setgid,
     setuid,
 };
 use std::error::Error;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::ffi::c_int;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::thread::JoinHandle;
 use garnshared::error_types::SendableError;
+use log::error;
+use nix::sys::signal::{sigaction, Signal, SigHandler, SigAction, signal, SaFlags};
+use crate::join_guard::JoinGuard;
+
+/// Only used for the termination signal handler, NOWHERE ELSE!
+/// # SAFETY
+/// Only written to once before the signal handler is installed.
+static mut SHUTDOWN_EVENT_FOR_SIGNAL: c_int = -1;
 
 pub struct Runtime<S: State> {
     error_tx: Sender<SendableError>,
@@ -131,6 +138,8 @@ impl Runtime<Uninit> {
             return Err(Box::new(RuntimeError::SecureBitsNotSet));
         }
 
+        // Trying to escalate the privileges can itself be dangerous
+        /*
         if setuid(Uid::from_raw(0)).is_ok()
             || seteuid(Uid::from_raw(0)).is_ok()
             || {
@@ -164,8 +173,7 @@ impl Runtime<Uninit> {
                 }
             }
         }
-
-        // todo: more checks?
+        */
 
         Ok(())
     }
@@ -215,22 +223,53 @@ impl Runtime<Uninit> {
 }
 
 impl Runtime<Ready> {
-    pub fn listen(self) -> Runtime<Listening> {
+    pub fn listen(self) -> Result<Runtime<Listening>, SendableError> {
+        // Setup signal handler for graceful shutdown
+        // Safety: This is the only write to the static before the signal handler is installed.
+        unsafe {
+            SHUTDOWN_EVENT_FOR_SIGNAL = self.state_data.shutdown_event.as_raw_fd();
+        }
+        // Safety: The signal handler is async safe.
+        unsafe {
+            sigaction(Signal::SIGTERM, &SigAction::new(SigHandler::Handler(Self::termination_signal_handler), SaFlags::SA_RESTART, Signal::SIGTERM | Signal::SIGINT))
+        }?;
+        unsafe {
+            sigaction(Signal::SIGINT, &SigAction::new(SigHandler::Handler(Self::termination_signal_handler), SaFlags::SA_RESTART, Signal::SIGTERM | Signal::SIGINT))
+        }?;
+
         // Ownership of the socket is moved into the thread and handed back once the threads join.
         let error_tx = self.error_tx.clone();
         let welcome_socket = self.state_data.welcome_socket;
         let shutdown_event = Arc::clone(&self.state_data.shutdown_event);
-        let welcome_thread = thread::spawn(move || {
+        //let welcome_thread = thread::spawn(move || {
+        //    welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
+        //});
+        let welcome_thread = JoinGuard::from(thread::Builder::new().spawn(move || {
             welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
-        });
+        })?);
 
-        Runtime {
+        Ok(Runtime {
             error_tx: self.error_tx,
             working_dir_path: self.working_dir_path,
             state_data: Listening {
                 welcome_thread,
                 shutdown_event: self.state_data.shutdown_event,
             },
+        })
+    }
+
+    /// This function is async safe.
+    extern "C" fn termination_signal_handler(_signal: c_int) {
+        // Safety: backed by static's safety invariant
+        if unsafe{SHUTDOWN_EVENT_FOR_SIGNAL} != -1 {
+            let buf: i64 = 1;
+            // Safety: static read operation backed by static's safety invariant;
+            // a write operation to an invalid fd cannot cause UB;
+            // the value written to it is exactly 8 bytes;
+            // `write` is async safe.
+            unsafe {
+                let _ = libc::write(SHUTDOWN_EVENT_FOR_SIGNAL, &raw const buf as *const _, size_of_val(&buf));
+            }
         }
     }
 }
@@ -242,7 +281,7 @@ pub struct Ready {
     shutdown_event: Arc<EventFd>,
 }
 pub struct Listening {
-    welcome_thread: JoinHandle<()>,
+    welcome_thread: JoinGuard,
     shutdown_event: Arc<EventFd>,
 }
 

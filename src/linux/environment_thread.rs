@@ -15,6 +15,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use garnshared::error_types::SendableError;
+use crate::linux::util::unwrap_or_report_failure;
 
 macro_rules! report_error_and_close {
     ($e:expr, $name:expr, $error_tx:expr, $close_env_event:expr, $close_env_tx:expr) => {
@@ -71,7 +72,7 @@ pub fn environment_thread_main(
     // Event loop
     let mut break_loop = false;
     while !break_loop {
-        let mut events = vec![EpollEvent::empty(); sockets.len() + 1];
+        let mut events = vec![EpollEvent::empty(); sockets.len() + 2];
         let num_events = match epoll.wait(&mut events, EpollTimeout::NONE) {
             Ok(res) => res,
             Err(e) => {
@@ -158,7 +159,7 @@ fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Option
     let mut buffer: [u8; ENVIRONMENT_REQUEST_SIZE] = [0; ENVIRONMENT_REQUEST_SIZE];
     recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(Some)?;
 
-    let Ok(request_str) = String::from_utf8(buffer.to_vec()) else {
+    let Ok(request_str) = str::from_utf8(&buffer) else {
         let response = EnvironmentResponse::MalformedRequest.serialize();
         send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
         return Err(None);
@@ -178,41 +179,13 @@ fn handle_open_mutex(
     shm: &mut ShmAllocator,
     raw_fd: RawFd,
 ) -> Result<(), Vec<SendableError>> {
-    let shm_location = match shm.find_resource::<PthreadMutex>(&name) {
+    let shm_location = match unwrap_or_report_failure!(shm.find_resource::<PthreadMutex>(&name),raw_fd, EnvironmentResponse) {
         // Mutex already exists
-        Ok(Some(res)) => res,
+        Some(res) => res,
         // Mutex doesn't exist yet
-        Ok(None) => {
-            let mut mutex = MaybeUninit::uninit();
-            // SAFETY: mutex was just reserved, MaybeUninit guarantees size and align.
-            if let Err(e) = unsafe { PthreadMutex::init(&raw mut mutex) } {
-                let mut errors: Vec<SendableError> = vec![Box::new(e)];
-                let response = EnvironmentResponse::InternalError.serialize();
-                send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                    .map(|_| ())
-                    .unwrap_or_else(|e2| errors.push(Box::new(e2)));
-                return Err(errors);
-            }
-            // SAFETY: mutex was just initialized and the result checked
-            match shm.move_into_shm(&name, unsafe { mutex.assume_init() }) {
-                Ok(res) => res,
-                Err(e) => {
-                    let mut errors: Vec<SendableError> = vec![e];
-                    let response = EnvironmentResponse::InternalError.serialize();
-                    send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                        .map(|_| ())
-                        .unwrap_or_else(|e2| errors.push(Box::new(e2)));
-                    return Err(errors);
-                }
-            }
-        }
-        Err(e) => {
-            let mut errors: Vec<SendableError> = vec![e];
-            let response = EnvironmentResponse::InternalError.serialize();
-            send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                .map(|_| ())
-                .unwrap_or_else(|e2| errors.push(Box::new(e2)));
-            return Err(errors);
+        None => {
+            // SAFETY: All points rather obviously enforced by shm.construct_in_shm
+            unwrap_or_report_failure!(shm.construct_in_shm(&name, |slot| unsafe {PthreadMutex::init(slot)}), raw_fd, EnvironmentResponse)
         }
     };
 

@@ -1,27 +1,24 @@
-use crate::linux::envoironment_thread::environment_thread_main;
+use crate::linux::environment_thread::environment_thread_main;
 use garnshared::error_types::SendableError;
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use std::mem::ManuallyDrop;
 use std::os::fd::OwnedFd;
-use std::panic::resume_unwind;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::thread::JoinHandle;
 use nix::errno::Errno;
+use crate::join_guard::JoinGuard;
 use crate::util::warn;
 
 pub struct Environment {
     add_listener_event: Arc<EventFd>,
     add_listener_tx: Sender<OwnedFd>,
     drop_event: Arc<EventFd>,
-    thread: JoinHandle<()>,
+    thread: JoinGuard,
 }
 
 impl Environment {
     pub fn new(
         name: &str,
-        socket: OwnedFd,
         error_tx: Sender<SendableError>,
         close_env_event: Arc<EventFd>,
         close_env_tx: Sender<String>,
@@ -38,7 +35,7 @@ impl Environment {
         );
         let thread_add_listener_event = add_listener_event.clone();
         let thread_drop_event = drop_event.clone();
-        let thread = thread::spawn(move || {
+        let thread = JoinGuard::from(thread::Builder::new().spawn(move || {
             environment_thread_main(
                 &name,
                 error_tx,
@@ -48,15 +45,13 @@ impl Environment {
                 add_listener_rx,
                 thread_drop_event,
             );
-        });
-        let mut self_ = Self {
+        })?);
+        Ok(Self {
             add_listener_event,
             add_listener_tx,
             drop_event,
             thread,
-        };
-        self_.insert_socket(socket)?;
-        Ok(self_)
+        })
     }
 
     pub fn insert_socket(&mut self, socket: OwnedFd) -> Result<(), SendableError> {

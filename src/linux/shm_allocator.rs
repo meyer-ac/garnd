@@ -1,28 +1,28 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
 use crate::util::warn;
+use garnshared::error_types::SendableError;
+use garnshared::linux::traits::ShmCompatible;
+use hashed_type_def::HashedTypeMethods;
+use nix::fcntl::{FcntlArg, SealFlag, fcntl};
 use nix::libc::off_t;
-use nix::fcntl::{FcntlArg, SealFlag};
-use nix::sys::memfd::MFdFlags;
-use nix::sys::mman::{MapFlags, ProtFlags};
-use nix::unistd::SysconfVar;
+use nix::sys::memfd::{MFdFlags, memfd_create};
+use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
+use nix::unistd::{SysconfVar, ftruncate, sysconf};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::num::NonZero;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::panic::{catch_unwind, UnwindSafe, resume_unwind};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::panic::{UnwindSafe, catch_unwind, resume_unwind};
 use std::ptr::NonNull;
-use garnshared::error_types::SendableError;
-use garnshared::linux::traits::ShmSync;
-use hashed_type_def::HashedTypeMethods;
 use uuid::Uuid;
-use super::miri::{AsFd, fcntl, memfd_create, ftruncate, sysconf, mmap, munmap};
 
 #[derive(Copy, Clone)]
 pub struct ClientResourceLocation {
     pub page: usize,
     pub offset: usize,
-    pub fd: RawFd
+    pub fd: RawFd,
 }
 
 struct ResourceMetadata {
@@ -60,11 +60,15 @@ impl ShmAllocator {
         })
     }
 
-    pub fn move_into_shm<T: ShmSync>(
+    pub fn construct_in_shm<T, F>(
         &mut self,
         name: &str,
-        resource: T,
-    ) -> Result<ClientResourceLocation, SendableError> {
+        placement_constructor: F,
+    ) -> Result<ClientResourceLocation, SendableError>
+    where
+        T: ShmCompatible,
+        F: FnOnce(*mut MaybeUninit<T>) -> Result<(), SendableError>,
+    {
         if self.resources.contains_key(name) {
             return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse));
         }
@@ -104,12 +108,17 @@ impl ShmAllocator {
                 .as_ptr()
                 .add(aligned_free_ptr)
         }
-        .cast::<T>();
+        .cast::<MaybeUninit<T>>();
+
+        /*
         // SAFETY: dest is writable (guaranteed by create_new_page)
         // and aligned (guaranteed by alignment of the free pointer)
         unsafe {
             dest.write(resource);
         }
+         */
+
+        placement_constructor(dest)?;
 
         self.resources.insert(
             name.to_string(),
@@ -129,11 +138,14 @@ impl ShmAllocator {
         Ok(ClientResourceLocation {
             page: self.pages.len() - 1,
             offset: aligned_free_ptr,
-            fd: self.pages.last().unwrap().fd.as_raw_fd()
+            fd: self.pages.last().unwrap().fd.as_raw_fd(),
         })
     }
 
-    pub fn find_resource<T: ShmSync>(&self, name: &str) -> Result<Option<ClientResourceLocation>, SendableError> {
+    pub fn find_resource<T: ShmCompatible>(
+        &self,
+        name: &str,
+    ) -> Result<Option<ClientResourceLocation>, SendableError> {
         let Some(resource_metadata) = self.resources.get(name) else {
             return Ok(None);
         };
@@ -144,28 +156,6 @@ impl ShmAllocator {
             page: resource_metadata.page,
             offset: resource_metadata.offset,
             fd: self.pages[resource_metadata.page].fd.as_raw_fd(),
-        }))
-    }
-
-    pub fn access_resource<T: ShmSync>(&self, name: &str) -> Result<Option<&T>, SendableError> {
-        let Some(loc) = self.find_resource::<T>(name)? else {
-            return Ok(None);
-        };
-        // SAFETY: raw pointer dereference: alignment is guaranteed by move_into_shm,
-        // non-null and dereferenceable is guaranteed by mmap,
-        // valid type is guaranteed by last if-clause,
-        // no mutable references exist (because it is impossible to acquire one)
-        // and safe Rust guarantees that this references will not be mutated.
-        // Since there is no way to deallocate or modify a resource, the reference is valid for as
-        // long as self is alive.
-        // add: offset fits into isize, because the upper half of addresses is reserved for kernel space and
-        // the whole range between the original address and the offset address belongs to the same
-        // allocation (anonymous file). The address does also not wrap around the address space,
-        // because the whole file is guaranteed to be in the lower half of the address space.
-        Ok(Some(unsafe {
-            &*self.pages[loc.page].mem.as_ptr()
-                .add(loc.offset)
-                .cast::<T>()
         }))
     }
 
