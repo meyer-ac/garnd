@@ -5,11 +5,7 @@ macro_rules! unwrap_or_report_failure {
             Err(e) => {
                 let mut errors: Vec<SendableError> = vec![$err_map(e)];
                 let response = $response_type::InternalError.serialize();
-                if let Err(e) = send(
-                    $client_fd,
-                    response.as_bytes(),
-                    MsgFlags::empty(),
-                ) {
+                if let Err(e) = send($client_fd, response.as_bytes(), MsgFlags::empty()) {
                     errors.push(Box::new(e));
                 }
                 return Err(errors);

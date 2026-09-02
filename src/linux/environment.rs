@@ -1,19 +1,18 @@
+use crate::join_guard::JoinGuard;
 use crate::linux::environment_thread::environment_thread_main;
+use crate::util::warn;
 use garnshared::error_types::SendableError;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::os::fd::OwnedFd;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use nix::errno::Errno;
-use crate::join_guard::JoinGuard;
-use crate::util::warn;
 
 pub struct Environment {
     add_listener_event: Arc<EventFd>,
     add_listener_tx: Sender<OwnedFd>,
     drop_event: Arc<EventFd>,
-    thread: JoinGuard,
+    _thread: JoinGuard,
 }
 
 impl Environment {
@@ -24,33 +23,33 @@ impl Environment {
         close_env_tx: Sender<String>,
     ) -> Result<Self, SendableError> {
         let name = name.to_owned();
-        let add_listener_event = Arc::new(
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-                ?,
-        );
+        let add_listener_event = Arc::new(EventFd::from_value_and_flags(
+            0,
+            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+        )?);
         let (add_listener_tx, add_listener_rx) = mpsc::channel::<OwnedFd>();
-        let drop_event = Arc::new(
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
-                ?,
-        );
+        let drop_event = Arc::new(EventFd::from_value_and_flags(
+            0,
+            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+        )?);
         let thread_add_listener_event = add_listener_event.clone();
         let thread_drop_event = drop_event.clone();
         let thread = JoinGuard::from(thread::Builder::new().spawn(move || {
             environment_thread_main(
                 &name,
-                error_tx,
-                close_env_event,
-                close_env_tx,
-                thread_add_listener_event,
-                add_listener_rx,
-                thread_drop_event,
+                &error_tx,
+                &close_env_event,
+                &close_env_tx,
+                &thread_add_listener_event,
+                &add_listener_rx,
+                &thread_drop_event,
             );
         })?);
         Ok(Self {
             add_listener_event,
             add_listener_tx,
             drop_event,
-            thread,
+            _thread: thread,
         })
     }
 
@@ -63,11 +62,12 @@ impl Environment {
 
 impl Drop for Environment {
     fn drop(&mut self) {
-        if let Err(e) = self.drop_event.write(1) {
+        let result = self.drop_event.write(1);
+        if let Err(e) = &result {
             if thread::panicking() {
-                warn(&format!("Environment panicked while destructing: {}", e.to_string()));
+                warn(&format!("Environment panicked while destructing: {e}"));
             } else {
-                Err::<usize, Errno>(e).unwrap();
+                result.unwrap();
             }
         }
     }

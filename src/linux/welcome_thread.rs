@@ -16,10 +16,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 
+#[allow(clippy::needless_pass_by_value)] // This function should take ownership over the welcome socket, it's part of the semantics
 pub fn welcome_thread_main(
-    error_tx: Sender<SendableError>,
+    error_tx: &Sender<SendableError>,
     welcome_socket: OwnedFd,
-    shutdown_event: Arc<EventFd>,
+    shutdown_event: &Arc<EventFd>,
 ) {
     // Initialization
     let mut environments = HashMap::new();
@@ -63,8 +64,7 @@ pub fn welcome_thread_main(
         if poll_shutdown.any().unwrap_or_default() {
             shutdown_event
                 .read()
-                .map(|_| ())
-                .unwrap_or_else(|e| send_error!(error_tx, e));
+                .map_or_else(|e| send_error!(error_tx, e), |_| ());
             send_error!(error_tx, ShutdownSignal {});
             return;
         }
@@ -73,8 +73,7 @@ pub fn welcome_thread_main(
         if poll_close_env.any().unwrap_or_default() {
             close_env_event
                 .read()
-                .map(|_| ())
-                .unwrap_or_else(|e| send_error!(error_tx, e));
+                .map_or_else(|e| send_error!(error_tx, e), |_| ());
             let name = match close_env_rx.recv() {
                 Ok(res) => res,
                 Err(e) => {
@@ -94,6 +93,7 @@ pub fn welcome_thread_main(
             send_error!(error_tx, RuntimeError::WelcomeSocketFailed);
             // We can't possibly recover from this failure => shutdown
             send_error!(error_tx, ShutdownSignal {});
+            continue;
         }
 
         let (client_fd, request) = match receive_and_parse_request(welcome_socket.as_fd()) {
@@ -108,9 +108,9 @@ pub fn welcome_thread_main(
         // Handle the requests accordingly
         match request {
             WelcomeRequest::OpenEnvironment(env_name) => handle_open_environment(
-                env_name,
+                &env_name,
                 &mut environments,
-                &error_tx,
+                error_tx,
                 client_fd,
                 &close_env_event,
                 &close_env_tx,
@@ -136,7 +136,7 @@ fn receive_and_parse_request(
         return Err(None);
     };
 
-    let Some(request) = WelcomeRequest::deserialize(&request_str) else {
+    let Some(request) = WelcomeRequest::deserialize(request_str) else {
         let response = WelcomeResponse::MalformedRequest.serialize();
         send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
         return Err(None);
@@ -145,8 +145,9 @@ fn receive_and_parse_request(
     Ok((client_fd, request))
 }
 
+#[allow(clippy::needless_pass_by_value)] // This function should take ownership over the client socket, it's part of the semantics
 fn handle_open_environment(
-    env_name: String,
+    env_name: &str,
     environments: &mut HashMap<String, Environment>,
     error_tx: &Sender<SendableError>,
     client_fd: OwnedFd,
@@ -159,11 +160,11 @@ fn handle_open_environment(
         WelcomeResponse,
         Box::new
     );
-    match environments.entry(env_name.clone()) {
+    match environments.entry(env_name.to_owned()) {
         Entry::Vacant(entry) => {
             let mut res = unwrap_or_report_failure!(
                 Environment::new(
-                    &env_name,
+                    env_name,
                     error_tx.clone(),
                     close_env_event.clone(),
                     close_env_tx.clone(),

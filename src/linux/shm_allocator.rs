@@ -15,6 +15,7 @@ use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::panic::{UnwindSafe, catch_unwind, resume_unwind};
+use std::pin::Pin;
 use std::ptr::NonNull;
 use uuid::Uuid;
 
@@ -67,21 +68,25 @@ impl ShmAllocator {
     ) -> Result<ClientResourceLocation, SendableError>
     where
         T: ShmCompatible,
-        F: FnOnce(*mut MaybeUninit<T>) -> Result<(), SendableError>,
+        F: FnOnce(Pin<&mut MaybeUninit<T>>) -> Result<(), SendableError>,
     {
         if self.resources.contains_key(name) {
             return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse));
         }
 
-        if self.pages.is_empty() {
-            self.create_new_page()?;
-        }
-
         let size = size_of::<T>();
         let align = align_of::<T>();
 
+        if size > self.page_size {
+            return Err(Box::new(RuntimeError::ResourceTooLargeForPage));
+        }
+
         if align > self.page_size {
             return Err(Box::new(RuntimeError::ResourceAlignmentLargerThanPage));
+        }
+
+        if self.pages.is_empty() {
+            self.create_new_page()?;
         }
 
         let mut aligned_free_ptr = self.get_aligned_free_pointer(size, align);
@@ -89,26 +94,27 @@ impl ShmAllocator {
         if aligned_free_ptr.is_none() {
             self.create_new_page()?;
             aligned_free_ptr = self.get_aligned_free_pointer(size, align);
-            if aligned_free_ptr.is_none() {
-                return Err(Box::new(RuntimeError::ResourceTooLargeForPage));
-            }
         }
         let aligned_free_ptr = aligned_free_ptr.unwrap();
         self.free_ptr = aligned_free_ptr + size;
 
-        // SAFETY: offset fits into isize, because the upper half of addresses is reserved for kernel space and
+        // SAFETY: add: offset fits into isize, because the upper half of addresses is reserved for kernel space and
         // the whole range between the original address and the offset address belongs to the same
         // allocation (anonymous file). The address does also not wrap around the address space,
         // because the whole file is guaranteed to be in the lower half of the address space.
+        // dereferencing: the raw pointer points to a well-aligned, right-sized slot. The slot
+        // is "initialized" in the sense that the MaybeUninit wrapper allows it to contain
+        // uninitialized memory.
         let dest = unsafe {
-            self.pages
-                .last()
+            &mut *self
+                .pages
+                .last_mut()
                 .unwrap()
                 .mem
                 .as_ptr()
                 .add(aligned_free_ptr)
-        }
-        .cast::<MaybeUninit<T>>();
+                .cast::<MaybeUninit<T>>()
+        };
 
         /*
         // SAFETY: dest is writable (guaranteed by create_new_page)
@@ -118,7 +124,9 @@ impl ShmAllocator {
         }
          */
 
-        placement_constructor(dest)?;
+        // SAFETY: ShmAllocator does not provide a way to move the pinned value through its safe
+        // interface
+        placement_constructor(unsafe { Pin::new_unchecked(dest) })?;
 
         self.resources.insert(
             name.to_string(),
@@ -160,32 +168,25 @@ impl ShmAllocator {
     }
 
     fn create_new_page(&mut self) -> Result<(), SendableError> {
-        let shm_fd = match memfd_create(
+        let shm_fd = memfd_create(
             constants::SHM_FILE_NAME,
             MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
-        ) {
-            Ok(res) => res,
-            Err(e) => return Err(Box::new(e)),
-        };
+        )?;
 
-        if let Err(e) = ftruncate(shm_fd.as_fd(), off_t::try_from(self.page_size).unwrap()) {
-            return Err(Box::new(e));
-        }
+        ftruncate(shm_fd.as_fd(), off_t::try_from(self.page_size)?)?;
 
-        if let Err(e) = fcntl(
+        fcntl(
             shm_fd.as_fd(),
             FcntlArg::F_ADD_SEALS(
                 SealFlag::F_SEAL_SEAL | SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_GROW,
             ),
-        ) {
-            return Err(Box::new(e));
-        }
+        )?;
 
         // SAFETY: length is guaranteed to be non-zero in Self::new(),
         // prot and flags are only passed valid flags,
         // offset is trivially a multiple of the system's page size and
         // addr is omitted.
-        match unsafe {
+        unsafe {
             mmap(
                 None,
                 NonZero::new(self.page_size).unwrap(),
@@ -194,19 +195,15 @@ impl ShmAllocator {
                 shm_fd.as_fd(),
                 0,
             )
-        } {
-            Ok(res) => {
-                self.pages.push(Page {
-                    fd: shm_fd,
-                    mem: res.cast::<u8>(),
-                });
-            }
-            Err(e) => return Err(Box::new(e)),
         }
-
-        self.free_ptr = 0;
-
-        Ok(())
+        .map(|res| {
+            self.free_ptr = 0;
+            self.pages.push(Page {
+                fd: shm_fd,
+                mem: res.cast::<u8>(),
+            });
+        })
+        .map_err(Box::from)
     }
 
     fn get_aligned_free_pointer(&self, size: usize, align: usize) -> Option<usize> {
@@ -249,7 +246,7 @@ impl Drop for ShmAllocator {
             // SAFETY: addr being a multiple of the page size is guaranteed by mmap, which
             // aligns the memory to page boundaries
             if let Err(e) = unsafe { munmap(page.mem.cast::<c_void>(), self.page_size) } {
-                warn(format!("unmapping of shared memory failed: {}", e).as_str());
+                warn(format!("unmapping of shared memory failed: {e}").as_str());
             }
         }
         if let Some(first_panic) = first_panic {

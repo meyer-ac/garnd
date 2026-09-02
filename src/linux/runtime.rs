@@ -1,31 +1,26 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
+use crate::join_guard::JoinGuard;
 use crate::linux::welcome_thread;
 use crate::util::warn;
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
+use garnshared::error_types::SendableError;
 use nix::errno::Errno as NixErrno;
 use nix::libc;
+use nix::libc::_exit;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::prctl::get_no_new_privs;
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
-use nix::sys::socket::{bind, setsockopt, socket, AddressFamily, SockFlag, SockType, UnixAddr};
-use nix::unistd::{
-    Gid, Uid, User, getgroups, getresgid, getresuid, setegid, seteuid, setfsgid, setfsuid, setgid,
-    setuid,
-};
-use std::error::Error;
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
+use nix::unistd::{Gid, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::thread::JoinHandle;
-use garnshared::error_types::SendableError;
-use log::error;
-use nix::sys::signal::{sigaction, Signal, SigHandler, SigAction, signal, SaFlags};
-use crate::join_guard::JoinGuard;
 
 /// Only used for the termination signal handler, NOWHERE ELSE!
 /// # SAFETY
@@ -78,7 +73,8 @@ impl Runtime<Uninit> {
             }
         }
         #[allow(unreachable_code)] // Only unreachable in debug mode, which is intended
-        let garn_user = User::from_name(constants::USER_NAME)?.ok_or(Box::new(RuntimeError::UserNonexistent))?;
+        let garn_user = User::from_name(constants::USER_NAME)?
+            .ok_or(Box::new(RuntimeError::UserNonexistent))?;
 
         let res_uid = getresuid()?;
         if res_uid.real != garn_user.uid
@@ -106,8 +102,8 @@ impl Runtime<Uninit> {
             return Err(Box::new(RuntimeError::RunWithRootGroup));
         }
 
-        for cap in caps::all().iter() {
-            for cap_set in [caps::CapSet::Permitted, caps::CapSet::Bounding].iter() {
+        for cap in &caps::all() {
+            for cap_set in &[caps::CapSet::Permitted, caps::CapSet::Bounding] {
                 let has_cap = caps::has_cap(None, *cap_set, *cap)?;
                 if has_cap {
                     return Err(Box::new(RuntimeError::RunWithCapabilities));
@@ -138,43 +134,6 @@ impl Runtime<Uninit> {
             return Err(Box::new(RuntimeError::SecureBitsNotSet));
         }
 
-        // Trying to escalate the privileges can itself be dangerous
-        /*
-        if setuid(Uid::from_raw(0)).is_ok()
-            || seteuid(Uid::from_raw(0)).is_ok()
-            || {
-                setfsuid(Uid::from_raw(0));
-                setfsuid(Uid::from_raw(u32::MAX)) == Uid::from_raw(0)
-            }
-            || setgid(Gid::from_raw(0)).is_ok()
-            || setegid(Gid::from_raw(0)).is_ok()
-            || {
-                setfsgid(Gid::from_raw(0));
-                setfsgid(Gid::from_raw(u32::MAX)) == Gid::from_raw(0)
-            }
-        {
-            return Err(Box::new(RuntimeError::CanGainPrivileges));
-        }
-
-        for cap in caps::all().iter() {
-            for cap_set in [
-                caps::CapSet::Bounding,
-                caps::CapSet::Permitted,
-                caps::CapSet::Ambient,
-                caps::CapSet::Effective,
-                caps::CapSet::Inheritable,
-            ]
-            .iter()
-            {
-                let mut caps_hash_set = caps::CapsHashSet::with_capacity(1);
-                caps_hash_set.insert(*cap);
-                if caps::set(None, *cap_set, &caps_hash_set).is_ok() {
-                    return Err(Box::new(RuntimeError::CanGainPrivileges));
-                }
-            }
-        }
-        */
-
         Ok(())
     }
 
@@ -191,13 +150,12 @@ impl Runtime<Uninit> {
             return Err(Box::new(e));
         }
 
-        let welcome_sock_name = String::from_iter(
-            [
-                garnshared::constants::ABSTRACT_SOCK_NAME_PREFIX,
-                garnshared::constants::WELCOME_SOCK_ABSTRACT_NAME,
-            ]
-            .into_iter(),
-        );
+        let welcome_sock_name = [
+            garnshared::constants::ABSTRACT_SOCK_NAME_PREFIX,
+            garnshared::constants::WELCOME_SOCK_ABSTRACT_NAME,
+        ]
+        .into_iter()
+        .collect::<String>();
         let addr = match UnixAddr::new_abstract(welcome_sock_name.as_bytes()) {
             Ok(res) => res,
             Err(e) => return Err(Box::new(e)),
@@ -231,10 +189,24 @@ impl Runtime<Ready> {
         }
         // Safety: The signal handler is async safe.
         unsafe {
-            sigaction(Signal::SIGTERM, &SigAction::new(SigHandler::Handler(Self::termination_signal_handler), SaFlags::SA_RESTART, Signal::SIGTERM | Signal::SIGINT))
+            sigaction(
+                Signal::SIGTERM,
+                &SigAction::new(
+                    SigHandler::Handler(Self::termination_signal_handler),
+                    SaFlags::SA_RESTART,
+                    Signal::SIGTERM | Signal::SIGINT,
+                ),
+            )
         }?;
         unsafe {
-            sigaction(Signal::SIGINT, &SigAction::new(SigHandler::Handler(Self::termination_signal_handler), SaFlags::SA_RESTART, Signal::SIGTERM | Signal::SIGINT))
+            sigaction(
+                Signal::SIGINT,
+                &SigAction::new(
+                    SigHandler::Handler(Self::termination_signal_handler),
+                    SaFlags::SA_RESTART,
+                    Signal::SIGTERM | Signal::SIGINT,
+                ),
+            )
         }?;
 
         // Ownership of the socket is moved into the thread and handed back once the threads join.
@@ -245,14 +217,14 @@ impl Runtime<Ready> {
         //    welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
         //});
         let welcome_thread = JoinGuard::from(thread::Builder::new().spawn(move || {
-            welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
+            welcome_thread::welcome_thread_main(&error_tx, welcome_socket, &shutdown_event);
         })?);
 
         Ok(Runtime {
             error_tx: self.error_tx,
             working_dir_path: self.working_dir_path,
             state_data: Listening {
-                welcome_thread,
+                _welcome_thread: welcome_thread,
                 shutdown_event: self.state_data.shutdown_event,
             },
         })
@@ -261,14 +233,26 @@ impl Runtime<Ready> {
     /// This function is async safe.
     extern "C" fn termination_signal_handler(_signal: c_int) {
         // Safety: backed by static's safety invariant
-        if unsafe{SHUTDOWN_EVENT_FOR_SIGNAL} != -1 {
+        if unsafe { SHUTDOWN_EVENT_FOR_SIGNAL } == -1 {
+            warn(
+                "Termination requested in an early or invalid state of the program, exiting immediately.",
+            );
+            // Safety: Potentially ill-formed program states are irrelevant here, because we exit immediately anyway
+            unsafe {
+                _exit(-1);
+            }
+        } else {
             let buf: i64 = 1;
             // Safety: static read operation backed by static's safety invariant;
             // a write operation to an invalid fd cannot cause UB;
             // the value written to it is exactly 8 bytes;
             // `write` is async safe.
             unsafe {
-                let _ = libc::write(SHUTDOWN_EVENT_FOR_SIGNAL, &raw const buf as *const _, size_of_val(&buf));
+                let _ = libc::write(
+                    SHUTDOWN_EVENT_FOR_SIGNAL,
+                    (&raw const buf).cast::<libc::c_void>(),
+                    size_of_val(&buf),
+                );
             }
         }
     }
@@ -281,7 +265,7 @@ pub struct Ready {
     shutdown_event: Arc<EventFd>,
 }
 pub struct Listening {
-    welcome_thread: JoinGuard,
+    _welcome_thread: JoinGuard,
     shutdown_event: Arc<EventFd>,
 }
 
@@ -291,13 +275,13 @@ impl State for Listening {}
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        if let Err(e) = self.shutdown_event.write(1) {
+        let result = self.shutdown_event.write(1);
+        if let Err(e) = &result {
             if thread::panicking() {
-                warn(format!("signaling welcome thread failed: {}", e.to_string()).as_str());
+                warn(format!("signaling welcome thread failed: {e}").as_str());
                 return;
-            } else {
-                Err::<usize, nix::errno::Errno>(e).unwrap();
             }
+            result.unwrap();
         }
     }
 }
