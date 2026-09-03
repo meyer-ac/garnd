@@ -1,7 +1,8 @@
-use crate::util::{try_extract_error_message, warn};
+use crate::util::warn;
 use std::mem::ManuallyDrop;
 use std::thread;
 use std::thread::JoinHandle;
+use garnshared::util::try_extract_error_message;
 
 pub struct JoinGuard {
     join_handle: ManuallyDrop<JoinHandle<()>>,
