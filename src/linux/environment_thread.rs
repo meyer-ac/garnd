@@ -210,7 +210,6 @@ fn handle_open_mutex(
         Some(res) => res,
         // Mutex doesn't exist yet
         None => {
-            // SAFETY: All points rather obviously enforced by shm.construct_in_shm
             unwrap_or_report_failure!(
                 shm.construct_in_shm(name, PthreadMutex::init),
                 raw_fd,
