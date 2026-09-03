@@ -4,13 +4,14 @@ use crate::util::warn;
 use garnshared::error_types::SendableError;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::os::fd::OwnedFd;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
 pub struct Environment {
     add_listener_event: Arc<EventFd>,
     add_listener_tx: Sender<OwnedFd>,
+    sync_response_rx: Receiver<Result<(), SendableError>>,
     drop_event: Arc<EventFd>,
     _thread: JoinGuard,
 }
@@ -28,6 +29,7 @@ impl Environment {
             EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
         )?);
         let (add_listener_tx, add_listener_rx) = mpsc::channel::<OwnedFd>();
+        let (sync_response_tx, sync_response_rx) = mpsc::channel::<Result<(), SendableError>>();
         let drop_event = Arc::new(EventFd::from_value_and_flags(
             0,
             EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
@@ -38,6 +40,7 @@ impl Environment {
             environment_thread_main(
                 &name,
                 &error_tx,
+                &sync_response_tx,
                 &close_env_event,
                 &close_env_tx,
                 &thread_add_listener_event,
@@ -48,6 +51,7 @@ impl Environment {
         Ok(Self {
             add_listener_event,
             add_listener_tx,
+            sync_response_rx,
             drop_event,
             _thread: thread,
         })
@@ -56,7 +60,7 @@ impl Environment {
     pub fn insert_socket(&mut self, socket: OwnedFd) -> Result<(), SendableError> {
         self.add_listener_tx.send(socket)?;
         self.add_listener_event.write(1)?;
-        Ok(())
+        self.sync_response_rx.recv()?
     }
 }
 

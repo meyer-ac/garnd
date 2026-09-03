@@ -27,9 +27,26 @@ macro_rules! report_error_and_close {
     };
 }
 
+macro_rules! pass_result_to_requesting_thread {
+    ($res:expr, $response_tx:expr, $error_tx:expr) => {
+        let _ = $res
+            .map(|_| {
+                let _ = $response_tx
+                    .send(Ok(()))
+                    .map_err(|e| send_error!($error_tx, e));
+            })
+            .map_err(|e| {
+                let _ = $response_tx
+                    .send(Err(Box::new(e)))
+                    .map_err(|e| send_error!($error_tx, e));
+            });
+    };
+}
+
 pub fn environment_thread_main(
     name: &str,
     error_tx: &Sender<SendableError>,
+    sync_response_tx: &Sender<Result<(), SendableError>>,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
     add_listener_event: &Arc<EventFd>,
@@ -80,12 +97,18 @@ pub fn environment_thread_main(
             }
         };
         for event in &events[..num_events] {
+            // Add a new listener
             #[allow(clippy::cast_sign_loss)]
             if event.data() == add_listener_event.as_raw_fd() as u64 {
-                add_listener(add_listener_event, add_listener_rx, &mut sockets, &epoll)
-                    .unwrap_or_else(|e| send_error!(error_tx, e));
+                pass_result_to_requesting_thread!(
+                    add_listener(add_listener_event, add_listener_rx, &mut sockets, &epoll),
+                    sync_response_tx,
+                    error_tx
+                );
                 continue;
             }
+
+            // Shut down the environment
             #[allow(clippy::cast_sign_loss)]
             if event.data() == drop_event.as_raw_fd() as u64 {
                 drop_event

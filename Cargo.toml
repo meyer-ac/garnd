@@ -11,4 +11,3 @@ errno = "0.3.14"
 hashed-type-def = "0.1.2"
 garnshared = { path = "../garnshared" }
 uuid = { version = "1.24.1", features = ["v4"] }
-log = "0.4.34"
