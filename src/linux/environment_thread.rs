@@ -98,6 +98,22 @@ pub fn environment_thread_main(
             #[allow(clippy::cast_possible_truncation)]
             let raw_fd = event.data() as RawFd;
 
+            // Did the client close the connection?
+            // Note: It's intended that we first check this and accept a potentially lost request
+            // as a consequence, as it can't be responded to anyway.
+            if event.events() & EpollFlags::from_bits_truncate(nix::libc::EPOLLRDHUP)
+                != EpollFlags::empty()
+            {
+                sockets.remove(raw_fd);
+                if sockets.is_empty() {
+                    announce_env_close(name, close_env_event, close_env_tx)
+                        .unwrap_or_else(|es| send_all_errors!(error_tx, es));
+                    break_loop = true;
+                    break;
+                }
+                continue;
+            }
+
             // Handle client request
             let request = match receive_and_parse_request(raw_fd) {
                 Ok(res) => res,
@@ -113,19 +129,6 @@ pub fn environment_thread_main(
             } {
                 send_all_errors!(error_tx, es);
                 continue;
-            }
-
-            // Did the client close the connection?
-            if event.events() & EpollFlags::from_bits_truncate(nix::libc::EPOLLRDHUP)
-                != EpollFlags::empty()
-            {
-                sockets.remove(raw_fd);
-                if sockets.is_empty() {
-                    announce_env_close(name, close_env_event, close_env_tx)
-                        .unwrap_or_else(|es| send_all_errors!(error_tx, es));
-                    break_loop = true;
-                    break;
-                }
             }
         }
     }
@@ -186,7 +189,7 @@ fn handle_open_mutex(
         None => {
             // SAFETY: All points rather obviously enforced by shm.construct_in_shm
             unwrap_or_report_failure!(
-                shm.construct_in_shm(name, |slot| unsafe { PthreadMutex::init(slot) }),
+                shm.construct_in_shm(name, PthreadMutex::init),
                 raw_fd,
                 EnvironmentResponse
             )

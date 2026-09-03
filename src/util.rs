@@ -15,6 +15,15 @@ pub fn warn(msg: &str) {
     eprintln!("garnd: WARNING! {msg}");
 }
 
+pub fn try_extract_error_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_owned)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or(format!("{payload:?}"))
+}
+
 #[macro_export]
 macro_rules! send_boxed_error {
     ($error_tx:expr, $err:expr) => {

@@ -1,4 +1,4 @@
-use crate::util::warn;
+use crate::util::{try_extract_error_message, warn};
 use std::mem::ManuallyDrop;
 use std::thread;
 use std::thread::JoinHandle;
@@ -22,7 +22,8 @@ impl Drop for JoinGuard {
             if thread::panicking() {
                 warn(
                     format!(
-                        "Joining thread in the destructor of JoinGuard failed: {e:?}",
+                        "Joining thread in the destructor of JoinGuard failed: {}",
+                        try_extract_error_message(e)
                     )
                     .as_str(),
                 );

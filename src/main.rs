@@ -33,7 +33,7 @@ fn main() {
         Err(e) => early_failure(&e.to_string()),
     };
 
-    let _runtime = runtime
+    let runtime = runtime
         .listen()
         .unwrap_or_else(|e| early_failure(&e.to_string()));
 
@@ -43,6 +43,8 @@ fn main() {
             break;
         }
     }
+
+    drop(runtime);
 
     // Catch the last few errors that may have occurred after the shutdown signal
     for err in error_receiver.try_iter() {
