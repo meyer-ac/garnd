@@ -3,6 +3,12 @@ cfg_if::cfg_if! {
         pub const USER_NAME: &str = "garnd";
         pub const GROUP_NAME: &str = "garnd";
         pub const SHM_FILE_NAME: &str = "shm";
+        
+        #[macro_export]
+        macro_rules! error_log_file_name {
+            ($datetime:expr) => {format!("errors_{}.log", $datetime)};
+        }
+        pub use error_log_file_name;
     }
 }
 

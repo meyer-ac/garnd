@@ -14,13 +14,15 @@ use nix::sys::prctl::get_no_new_privs;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
-use nix::unistd::{Gid, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
+use nix::sys::stat::{stat, Mode};
+use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
-use std::thread;
+use std::{fs, thread};
+use std::fs::File;
 
 /// Only used for the termination signal handler, NOWHERE ELSE!
 /// # SAFETY
@@ -52,6 +54,8 @@ impl Runtime<Uninit> {
     pub fn init(self) -> Result<Runtime<Ready>, SendableError> {
         Self::check_privileges()?;
 
+        self.setup_working_dir()?;
+
         let (welcome_socket, shutdown_event) = Self::setup_socket()?;
 
         Ok(Runtime {
@@ -75,7 +79,6 @@ impl Runtime<Uninit> {
         #[allow(unreachable_code)] // Only unreachable in debug mode, which is intended
         let garn_user = User::from_name(constants::USER_NAME)?
             .ok_or(Box::new(RuntimeError::UserNonexistent))?;
-
         let res_uid = getresuid()?;
         if res_uid.real != garn_user.uid
             || res_uid.effective != garn_user.uid
@@ -87,14 +90,16 @@ impl Runtime<Uninit> {
             return Err(Box::new(RuntimeError::RunAsWrongUser));
         }
 
+        let garn_group = Group::from_name(constants::GROUP_NAME)?
+            .ok_or(Box::new(RuntimeError::GroupNonexistent))?;
         let res_gid = getresgid()?;
-        if res_gid.real != garn_user.gid
-            || res_gid.effective != garn_user.gid
-            || res_gid.saved != garn_user.gid
+        if res_gid.real != garn_group.gid
+            || res_gid.effective != garn_group.gid
+            || res_gid.saved != garn_group.gid
         {
             return Err(Box::new(RuntimeError::RunAsWrongGroup));
         }
-        if setfsgid(Gid::from_raw(u32::MAX)) != garn_user.gid {
+        if setfsgid(Gid::from_raw(u32::MAX)) != garn_group.gid {
             return Err(Box::new(RuntimeError::RunAsWrongGroup));
         }
         let groups = getgroups()?;
@@ -134,6 +139,69 @@ impl Runtime<Uninit> {
             return Err(Box::new(RuntimeError::SecureBitsNotSet));
         }
 
+        Ok(())
+    }
+
+    fn setup_working_dir(&self) -> Result<(), SendableError> {
+        let working_dir_str = self
+            .working_dir_path
+            .clone()
+            .into_os_string()
+            .into_string()
+            .map_err(|_| Box::new(RuntimeError::WorkingDirPathInvalidString))?;
+        if !fs::exists(&self.working_dir_path)? {
+            return Err(Box::new(RuntimeError::WorkingDirNonexistent {
+                working_dir: working_dir_str,
+            }));
+        }
+        if !fs::metadata(&self.working_dir_path)?.is_dir() {
+            return Err(Box::new(RuntimeError::WorkingDirNotADirectory {
+                working_dir: working_dir_str,
+            }));
+        }
+        let stats = stat(&self.working_dir_path)?;
+
+        cfg_if! {
+            if #[cfg(debug_assertions)] {
+                return Ok(())
+            }
+        }
+
+        // Verify owner
+        let garn_user = User::from_name(constants::USER_NAME)?
+            .ok_or(Box::new(RuntimeError::UserNonexistent))?;
+        let garn_group = Group::from_name(constants::GROUP_NAME)?
+            .ok_or(Box::new(RuntimeError::GroupNonexistent))?;
+        let owner_user = User::from_uid(Uid::from_raw(stats.st_uid))?.unwrap();
+        let owner_group = Group::from_gid(Gid::from_raw(stats.st_gid))?.unwrap();
+        if owner_user.uid != garn_user.uid {
+            return Err(Box::new(RuntimeError::WorkingDirOwnedByWrongUser {
+                working_dir: working_dir_str,
+                owner: owner_user.name,
+            }));
+        }
+        if owner_group.gid != garn_group.gid {
+            return Err(Box::new(RuntimeError::WorkingDirOwnedByWrongGroup {
+                working_dir: working_dir_str,
+                owner: owner_user.name,
+            }));
+        }
+
+        // Verify permissions
+        let mode = Mode::from_bits_truncate(stats.st_mode);
+        if !(mode.contains(Mode::S_IRWXU | Mode::S_IRGRP | Mode::S_IXGRP | Mode::S_IROTH | Mode::S_IXOTH) && !mode.contains(Mode::S_IWGRP) && !mode.contains(Mode::S_IWOTH)) {
+            return Err(Box::new(RuntimeError::WorkingDirWrongPermissions {working_dir: working_dir_str, permissions: "rwxr-xr-x"}))
+        }
+        if mode.contains(Mode::S_ISUID) {
+            return Err(Box::new(RuntimeError::WorkingDirSetUidBitSet {working_dir: working_dir_str}));
+        }
+        if mode.contains(Mode::S_ISGID) {
+            return Err(Box::new(RuntimeError::WorkingDirSetGidBitSet {working_dir: working_dir_str}));
+        }
+        if mode.contains(Mode::S_ISVTX) {
+            return Err(Box::new(RuntimeError::WorkingDirStickyBitSet {working_dir: working_dir_str}));
+        }
+        
         Ok(())
     }
 
@@ -181,6 +249,10 @@ impl Runtime<Uninit> {
 }
 
 impl Runtime<Ready> {
+    pub fn create_log_file(&self, file_name: &str) -> Result<File, SendableError> {
+        File::create(self.working_dir_path.join(file_name)).map_err(Box::from)
+    }
+
     pub fn listen(self) -> Result<Runtime<Listening>, SendableError> {
         // Setup signal handler for graceful shutdown
         // Safety: This is the only write to the static before the signal handler is installed.

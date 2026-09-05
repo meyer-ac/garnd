@@ -151,7 +151,6 @@ pub fn environment_thread_main(
                 EnvironmentRequest::OpenMutex(name) => handle_open_mutex(&name, &mut shm, raw_fd),
             } {
                 send_all_errors!(error_tx, es);
-                continue;
             }
         }
     }

@@ -9,6 +9,7 @@ use nix::libc::off_t;
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use nix::unistd::{SysconfVar, ftruncate, sysconf};
+use std::any;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
@@ -71,18 +72,26 @@ impl ShmAllocator {
         F: FnOnce(Pin<&mut MaybeUninit<T>>) -> Result<(), SendableError>,
     {
         if self.resources.contains_key(name) {
-            return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse));
+            return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse {
+                resource_name: name.to_owned(),
+            }));
         }
 
         let size = size_of::<T>();
         let align = align_of::<T>();
 
         if size > self.page_size {
-            return Err(Box::new(RuntimeError::ResourceTooLargeForPage));
+            return Err(Box::new(RuntimeError::ResourceTooLargeForPage {
+                page_size: self.page_size,
+                size,
+            }));
         }
 
         if align > self.page_size {
-            return Err(Box::new(RuntimeError::ResourceAlignmentLargerThanPage));
+            return Err(Box::new(RuntimeError::ResourceAlignmentLargerThanPage {
+                page_size: self.page_size,
+                alignment: align,
+            }));
         }
 
         if self.pages.is_empty() {
@@ -158,7 +167,10 @@ impl ShmAllocator {
             return Ok(None);
         };
         if resource_metadata.type_id != T::type_uuid() {
-            return Err(Box::new(RuntimeError::ResourceTypeMismatch));
+            return Err(Box::new(RuntimeError::ResourceTypeMismatch {
+                requested_type: any::type_name::<T>(),
+                resource_type: "<unavailable at runtime>",
+            }));
         }
         Ok(Some(ClientResourceLocation {
             page: resource_metadata.page,
