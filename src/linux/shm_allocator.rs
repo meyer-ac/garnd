@@ -7,7 +7,7 @@ use hashed_type_def::HashedTypeMethods;
 use nix::fcntl::{FcntlArg, SealFlag, fcntl};
 use nix::libc::off_t;
 use nix::sys::memfd::{MFdFlags, memfd_create};
-use nix::sys::mman::{MapFlags, ProtFlags, mmap, mprotect, munmap};
+use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use nix::unistd::{SysconfVar, ftruncate, sysconf};
 use std::any;
 use std::collections::HashMap;
@@ -198,7 +198,7 @@ impl ShmAllocator {
         // prot and flags are only passed valid flags,
         // offset is trivially a multiple of the system's page size and
         // addr is omitted.
-        match unsafe {
+        unsafe {
             mmap(
                 None,
                 NonZero::new(self.page_size).unwrap(),
@@ -207,26 +207,15 @@ impl ShmAllocator {
                 shm_fd.as_fd(),
                 0,
             )
-        } {
-            Ok(res) => {
-                // SAFETY: `res` is valid and page-aligned
-                unsafe {
-                    mprotect(
-                        res,
-                        self.page_size,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    )?;
-                }
-                self.free_ptr = 0;
-                self.pages.push(Page {
-                    fd: shm_fd,
-                    mem: res.cast::<u8>(),
-                });
-            }
-            Err(e) => return Err(Box::new(e)),
         }
-
-        Ok(())
+        .map(|res| {
+            self.free_ptr = 0;
+            self.pages.push(Page {
+                fd: shm_fd,
+                mem: res.cast::<u8>(),
+            });
+        })
+        .map_err(Box::from)
     }
 
     fn get_aligned_free_pointer(&self, size: usize, align: usize) -> Option<usize> {
