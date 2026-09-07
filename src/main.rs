@@ -50,7 +50,7 @@ fn main() {
         if err.is::<ShutdownSignal>() {
             shutdown = true;
         }
-        logger.log(err);
+        logger.log(&err);
         if shutdown {
             break;
         }
@@ -60,6 +60,6 @@ fn main() {
 
     // Catch the last few errors that may have occurred after the shutdown signal
     for err in error_receiver.try_iter() {
-        logger.log(err);
+        logger.log(&err);
     }
 }

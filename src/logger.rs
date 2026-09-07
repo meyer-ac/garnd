@@ -17,8 +17,8 @@ impl Logger {
         constants::error_log_file_name!(Local::now().format("%Y-%m-%d_%H:%M:%S%.3f").to_string())
     }
 
-    pub fn log(&mut self, error: SendableError) {
+    pub fn log(&mut self, error: &SendableError) {
         let datetime = Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        write!(self.log_file, "[{datetime}] {error}\n").unwrap_or_else(|e| eprintln!("{}", e));
+        writeln!(self.log_file, "[{datetime}] {error}").unwrap_or_else(|e| eprintln!("{e}"));
     }
 }

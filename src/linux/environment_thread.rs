@@ -43,6 +43,7 @@ macro_rules! pass_result_to_requesting_thread {
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn environment_thread_main(
     name: &str,
     error_tx: &Sender<SendableError>,

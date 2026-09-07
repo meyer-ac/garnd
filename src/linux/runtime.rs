@@ -159,13 +159,15 @@ impl Runtime<Uninit> {
                 working_dir: working_dir_str,
             }));
         }
-        let stats = stat(&self.working_dir_path)?;
 
         cfg_if! {
             if #[cfg(debug_assertions)] {
                 return Ok(())
             }
         }
+
+        #[allow(unreachable_code)] // Only reachable in release mode, intended
+        let stats = stat(&self.working_dir_path)?;
 
         // Verify owner
         let garn_user = User::from_name(constants::USER_NAME)?
