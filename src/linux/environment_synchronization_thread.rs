@@ -141,11 +141,10 @@ pub fn environment_synchronization_thread_main(
             // Handle client request
             let request = match receive_and_parse_request(raw_fd) {
                 Ok(res) => res,
-                Err(Some(e)) => {
-                    send_error!(error_tx, e);
+                Err(e) => {
+                    send_all_errors!(error_tx, e);
                     continue;
                 }
-                Err(None) => continue,
             };
 
             if let Err(es) = match request {
@@ -177,20 +176,40 @@ fn add_listener(
     Ok(())
 }
 
-fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Option<Errno>> {
+fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Vec<SendableError>> {
     let mut buffer: [u8; ENVIRONMENT_REQUEST_SIZE] = [0; ENVIRONMENT_REQUEST_SIZE];
-    recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(Some)?;
+    recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
 
-    let Ok(request_str) = str::from_utf8(&buffer) else {
-        let response = EnvironmentResponse::MalformedRequest.serialize();
-        send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
-        return Err(None);
+    let request_str = match str::from_utf8(&buffer) {
+        Ok(res) => res,
+        Err(e) => {
+            let mut errors = vec![Box::from(e)];
+            let Ok(response) = EnvironmentResponse::MalformedRequest
+                .serialize()
+                .map_err(|e| errors.push(Box::from(e)))
+            else {
+                return Err(errors);
+            };
+            send(raw_fd, response.as_bytes(), MsgFlags::empty())
+                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+            return Err(errors);
+        }
     };
 
-    let Some(request) = EnvironmentRequest::deserialize(request_str) else {
-        let response = EnvironmentResponse::MalformedRequest.serialize();
-        send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
-        return Err(None);
+    let request = match EnvironmentRequest::deserialize(request_str) {
+        Ok(res) => res,
+        Err(e) => {
+            let mut errors = vec![Box::from(e)];
+            let Ok(response) = EnvironmentResponse::MalformedRequest
+                .serialize()
+                .map_err(|e| errors.push(Box::from(e)))
+            else {
+                return Err(errors);
+            };
+            send(raw_fd, response.as_bytes(), MsgFlags::empty())
+                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+            return Err(errors);
+        }
     };
 
     Ok(request)
@@ -219,8 +238,13 @@ fn handle_open_mutex(
     };
 
     // Pass shared memory page to client
-    let response =
-        EnvironmentResponse::OpenMutexOk(shm_location.page, shm_location.offset).serialize();
+    let response = unwrap_or_report_failure!(
+        EnvironmentResponse::OpenMutexOk(shm_location.page, shm_location.offset)
+            .serialize()
+            .map_err(Box::from),
+        raw_fd,
+        EnvironmentResponse
+    );
     let iov = [IoSlice::new(response.as_bytes())];
     let fds = [shm_location.fd];
     let cmsg = ControlMessage::ScmRights(&fds);

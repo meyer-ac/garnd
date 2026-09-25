@@ -6,7 +6,6 @@ use crate::{send_all_errors, send_error};
 use garnshared::constants::WELCOME_REQUEST_SIZE;
 use garnshared::error_types::SendableError;
 use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse};
-use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::socket::{Backlog, MsgFlags, accept, listen, recv, send};
@@ -98,11 +97,10 @@ pub fn welcome_thread_main(
 
         let (client_fd, request) = match receive_and_parse_request(welcome_socket.as_fd()) {
             Ok(res) => res,
-            Err(Some(e)) => {
-                send_error!(error_tx, e);
+            Err(e) => {
+                send_all_errors!(error_tx, e);
                 continue;
             }
-            Err(None) => continue,
         };
 
         // Handle the requests accordingly
@@ -122,24 +120,44 @@ pub fn welcome_thread_main(
 
 fn receive_and_parse_request(
     welcome_socket: BorrowedFd,
-) -> Result<(OwnedFd, WelcomeRequest), Option<Errno>> {
-    let raw_fd = accept(welcome_socket.as_raw_fd()).map_err(Some)?;
+) -> Result<(OwnedFd, WelcomeRequest), Vec<SendableError>> {
+    let raw_fd = accept(welcome_socket.as_raw_fd()).map_err(|e| vec![Box::from(e)])?;
     // SAFETY: res is open and suitable for taking ownership; the raw fd is immediately discarded
     let client_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
     let mut buffer: [u8; WELCOME_REQUEST_SIZE] = [0; WELCOME_REQUEST_SIZE];
-    recv(raw_fd, &mut buffer, MsgFlags::empty())?;
+    recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
 
-    let Ok(request_str) = str::from_utf8(&buffer) else {
-        let response = WelcomeResponse::MalformedRequest.serialize();
-        send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
-        return Err(None);
+    let request_str = match str::from_utf8(&buffer) {
+        Ok(res) => res,
+        Err(e) => {
+            let mut errors = vec![Box::from(e)];
+            let Ok(response) = WelcomeResponse::MalformedRequest
+                .serialize()
+                .map_err(|e| errors.push(Box::from(e)))
+            else {
+                return Err(errors);
+            };
+            send(raw_fd, response.as_bytes(), MsgFlags::empty())
+                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+            return Err(errors);
+        }
     };
 
-    let Some(request) = WelcomeRequest::deserialize(request_str) else {
-        let response = WelcomeResponse::MalformedRequest.serialize();
-        send(raw_fd, response.as_bytes(), MsgFlags::empty()).map_err(Some)?;
-        return Err(None);
+    let request = match WelcomeRequest::deserialize(request_str) {
+        Ok(res) => res,
+        Err(e) => {
+            let mut errors = vec![Box::from(e)];
+            let Ok(response) = WelcomeResponse::MalformedRequest
+                .serialize()
+                .map_err(|e| errors.push(Box::from(e)))
+            else {
+                return Err(errors);
+            };
+            send(raw_fd, response.as_bytes(), MsgFlags::empty())
+                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+            return Err(errors);
+        }
     };
 
     Ok((client_fd, request))
@@ -187,7 +205,13 @@ fn handle_open_environment(
             );
         }
     }
-    let response = WelcomeResponse::OpenEnvironmentOk.serialize();
+    let response = unwrap_or_report_failure!(
+        WelcomeResponse::OpenEnvironmentOk
+            .serialize()
+            .map_err(Box::from),
+        client_fd.as_raw_fd(),
+        WelcomeResponse
+    );
     if let Err(e) = send(
         client_fd.as_raw_fd(),
         response.as_bytes(),
