@@ -18,7 +18,7 @@ impl Logger {
     }
 
     pub fn log(&mut self, error: &SendableError) {
-        let datetime = Local::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let datetime = Local::now().format("%Y-%m-%dT%H:%M:%S%.f%:z").to_string();
         writeln!(self.log_file, "[{datetime}] {error}").unwrap_or_else(|e| eprintln!("{e}"));
     }
 }
