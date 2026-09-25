@@ -14,7 +14,7 @@ impl Logger {
     }
 
     pub fn log_file_name() -> String {
-        constants::error_log_file_name!(Local::now().format("%Y-%m-%d_%H:%M:%S%.3f").to_string())
+        constants::error_log_file_name!(Local::now())
     }
 
     pub fn log(&mut self, error: &SendableError) {
