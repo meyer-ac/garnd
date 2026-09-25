@@ -1,5 +1,5 @@
 use crate::join_guard::JoinGuard;
-use crate::linux::environment_thread::environment_thread_main;
+use crate::linux::environment_synchronization_thread::environment_synchronization_thread_main;
 use crate::util::warn;
 use garnshared::error_types::SendableError;
 use nix::sys::eventfd::{EfdFlags, EventFd};
@@ -37,7 +37,7 @@ impl Environment {
         let thread_add_listener_event = add_listener_event.clone();
         let thread_drop_event = drop_event.clone();
         let thread = JoinGuard::from(thread::Builder::new().spawn(move || {
-            environment_thread_main(
+            environment_synchronization_thread_main(
                 &name,
                 &error_tx,
                 &sync_response_tx,

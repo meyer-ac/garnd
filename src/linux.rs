@@ -1,5 +1,5 @@
 mod environment;
-mod environment_thread;
+mod environment_synchronization_thread;
 pub mod runtime;
 mod runtime_error;
 mod shm_allocator;
