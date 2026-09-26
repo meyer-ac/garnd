@@ -14,15 +14,15 @@ use nix::sys::prctl::get_no_new_privs;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
-use nix::sys::stat::{stat, Mode};
+use nix::sys::stat::{Mode, SFlag, stat};
 use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
+use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::{fs, thread};
-use std::fs::File;
 
 /// Only used for the termination signal handler, NOWHERE ELSE!
 /// # SAFETY
@@ -154,7 +154,8 @@ impl Runtime<Uninit> {
                 working_dir: working_dir_str,
             }));
         }
-        if !fs::metadata(&self.working_dir_path)?.is_dir() {
+        let stats = stat(&self.working_dir_path)?;
+        if !SFlag::from_bits_truncate(stats.st_mode).contains(SFlag::S_IFDIR) {
             return Err(Box::new(RuntimeError::WorkingDirNotADirectory {
                 working_dir: working_dir_str,
             }));
@@ -167,7 +168,6 @@ impl Runtime<Uninit> {
         }
 
         #[allow(unreachable_code)] // Only reachable in release mode, intended
-        let stats = stat(&self.working_dir_path)?;
 
         // Verify owner
         let garn_user = User::from_name(constants::USER_NAME)?
@@ -203,7 +203,7 @@ impl Runtime<Uninit> {
         if mode.contains(Mode::S_ISVTX) {
             return Err(Box::new(RuntimeError::WorkingDirStickyBitSet {working_dir: working_dir_str}));
         }
-        
+
         Ok(())
     }
 
@@ -214,7 +214,7 @@ impl Runtime<Uninit> {
             SockFlag::SOCK_CLOEXEC,
             None,
         )?;
-        
+
         if let Err(e) = setsockopt(&welcome_socket.as_fd(), PassCred, &true) {
             return Err(Box::new(e));
         }
