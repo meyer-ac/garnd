@@ -3,9 +3,8 @@ use crate::linux::runtime_error::RuntimeError;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::shutdown_signal::ShutdownSignal;
 use crate::{send_all_errors, send_error};
-use garnshared::constants::WELCOME_REQUEST_SIZE;
 use garnshared::error_types::SendableError;
-use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse};
+use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse, WELCOME_REQUEST_PROTOCOL};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::socket::{Backlog, MsgFlags, accept, listen, recv, send};
@@ -125,7 +124,7 @@ fn receive_and_parse_request(
     // SAFETY: res is open and suitable for taking ownership; the raw fd is immediately discarded
     let client_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-    let mut buffer: [u8; WELCOME_REQUEST_SIZE] = [0; WELCOME_REQUEST_SIZE];
+    let mut buffer = vec![0u8; WELCOME_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
     recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
 
     let request_str = match str::from_utf8(&buffer) {

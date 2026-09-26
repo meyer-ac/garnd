@@ -1,8 +1,7 @@
 use crate::linux::shm_allocator::ShmAllocator;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::{send_all_errors, send_error};
-use garnshared::constants::ENVIRONMENT_REQUEST_SIZE;
-use garnshared::environment_protocol::{EnvironmentRequest, EnvironmentResponse};
+use garnshared::environment_protocol::{EnvironmentRequest, EnvironmentResponse, ENVIRONMENT_REQUEST_PROTOCOL};
 use garnshared::error_types::SendableError;
 use garnshared::linux::pthread_mutex::PthreadMutex;
 use nix::errno::Errno;
@@ -177,7 +176,7 @@ fn add_listener(
 }
 
 fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Vec<SendableError>> {
-    let mut buffer: [u8; ENVIRONMENT_REQUEST_SIZE] = [0; ENVIRONMENT_REQUEST_SIZE];
+    let mut buffer = vec![0u8; ENVIRONMENT_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
     recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
 
     let request_str = match str::from_utf8(&buffer) {
