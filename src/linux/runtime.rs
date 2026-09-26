@@ -214,8 +214,7 @@ impl Runtime<Uninit> {
             SockFlag::SOCK_CLOEXEC,
             None,
         )?;
-
-        // todo: re-evaluate if this is necessary
+        
         if let Err(e) = setsockopt(&welcome_socket.as_fd(), PassCred, &true) {
             return Err(Box::new(e));
         }

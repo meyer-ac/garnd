@@ -7,12 +7,15 @@ use garnshared::error_types::SendableError;
 use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse, WELCOME_REQUEST_PROTOCOL};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use nix::sys::socket::{Backlog, MsgFlags, accept, listen, recv, send};
+use nix::sys::socket::{accept, getsockopt, listen, recv, send, Backlog, MsgFlags};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
+use nix::sys::socket::sockopt::PeerCredentials;
 
 #[allow(clippy::needless_pass_by_value)] // This function should take ownership over the welcome socket, it's part of the semantics
 pub fn welcome_thread_main(
@@ -124,6 +127,13 @@ fn receive_and_parse_request(
     // SAFETY: res is open and suitable for taking ownership; the raw fd is immediately discarded
     let client_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
+    // Ignore all requests from root. Don't even answer then, just don't interact at all with any
+    // root process for security reasons.
+    let creds = getsockopt(&client_fd.as_fd(), PeerCredentials).map_err(|e| vec![Box::from(e)])?;
+    if creds.uid() == 0 || creds.gid() == 0 {
+        return Err(vec![Box::new(IgnoredRootRequestError {})]);
+    }
+
     let mut buffer = vec![0u8; WELCOME_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
     recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
 
@@ -220,3 +230,14 @@ fn handle_open_environment(
     }
     Ok(())
 }
+
+#[derive(Debug)]
+struct IgnoredRootRequestError {}
+
+impl Display for IgnoredRootRequestError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a root process tried to contact this service; ignored the request")
+    }
+}
+
+impl Error for IgnoredRootRequestError {}
