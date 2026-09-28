@@ -14,7 +14,7 @@ use nix::sys::prctl::get_no_new_privs;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
-use nix::sys::stat::{Mode, SFlag, stat};
+use nix::sys::stat::{Mode, SFlag, lstat};
 use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
 use std::fs::File;
@@ -154,7 +154,7 @@ impl Runtime<Uninit> {
                 working_dir: working_dir_str,
             }));
         }
-        let stats = stat(&self.working_dir_path)?;
+        let stats = lstat(&self.working_dir_path)?;
         if !SFlag::from_bits_truncate(stats.st_mode).contains(SFlag::S_IFDIR) {
             return Err(Box::new(RuntimeError::WorkingDirNotADirectory {
                 working_dir: working_dir_str,
