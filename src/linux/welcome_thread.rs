@@ -130,7 +130,7 @@ fn receive_and_parse_request(
     // Ignore all requests from root. Don't even answer then, just don't interact at all with any
     // root process for security reasons.
     let creds = getsockopt(&client_fd.as_fd(), PeerCredentials).map_err(|e| vec![Box::from(e)])?;
-    if creds.uid() == 0 || creds.gid() == 0 {
+    if creds.uid() == 0 {
         return Err(vec![Box::new(IgnoredRootRequestError {})]);
     }
 
