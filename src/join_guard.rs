@@ -1,4 +1,4 @@
-use crate::util::warn;
+use crate::util::error_in_brittle_scenario;
 use std::mem::ManuallyDrop;
 use std::thread;
 use std::thread::JoinHandle;
@@ -21,7 +21,7 @@ impl Drop for JoinGuard {
         let result = unsafe { ManuallyDrop::<JoinHandle<()>>::take(&mut self.join_handle) }.join();
         if let Err(e) = &result {
             if thread::panicking() {
-                warn(
+                error_in_brittle_scenario(
                     format!(
                         "Joining thread in the destructor of JoinGuard failed: {}",
                         try_extract_error_message(e)

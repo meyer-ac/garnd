@@ -5,3 +5,4 @@ mod runtime_error;
 mod shm_allocator;
 mod util;
 mod welcome_thread;
+pub mod logger;

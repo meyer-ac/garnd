@@ -87,7 +87,7 @@ pub fn welcome_thread_main(
                         send_error!(error_tx, TryRecvError::Disconnected);
                         return;
                     }
-                };
+                }
             }
         }
 

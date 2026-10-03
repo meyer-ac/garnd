@@ -4,6 +4,7 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum RuntimeError {
+    PrivilegeChecksDisabled,
     UserNonexistent,
     GroupNonexistent,
     RunAsWrongUser,
@@ -33,6 +34,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PrivilegeChecksDisabled => write!(f, "privilege checks are disabled in debug mode"),
             Self::UserNonexistent => write!(f, "unable to find user '{}'", constants::USER_NAME),
             Self::GroupNonexistent => write!(f, "unable to find group '{}'", constants::GROUP_NAME),
             Self::RunAsWrongUser => write!(

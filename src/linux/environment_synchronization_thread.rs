@@ -183,6 +183,7 @@ fn add_listener(
                 // The only way this can happen is if the owning thread delegating new listeners to
                 // this thread has died. This is terrible and means that the program is in an already
                 // unrecoverable state => escalate and panic!
+                #[allow(clippy::unnecessary_literal_unwrap)]
                 Err::<OwnedFd, TryRecvError>(TryRecvError::Disconnected).unwrap();
             }
         }

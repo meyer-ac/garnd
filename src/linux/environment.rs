@@ -1,6 +1,6 @@
 use crate::join_guard::JoinGuard;
 use crate::linux::environment_synchronization_thread::environment_synchronization_thread_main;
-use crate::util::warn;
+use crate::util::error_in_brittle_scenario;
 use garnshared::error_types::SendableError;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::os::fd::OwnedFd;
@@ -69,7 +69,7 @@ impl Drop for Environment {
         let result = self.drop_event.write(1);
         if let Err(e) = &result {
             if thread::panicking() {
-                warn(&format!("Environment panicked while destructing: {e}"));
+                error_in_brittle_scenario(&format!("Environment panicked while destructing: {e}"));
             } else {
                 result.unwrap();
             }

@@ -1,8 +1,8 @@
 use super::runtime_error::RuntimeError;
-use crate::constants;
+use crate::{constants, send_error};
 use crate::join_guard::JoinGuard;
 use crate::linux::welcome_thread;
-use crate::util::warn;
+use crate::util::error_in_brittle_scenario;
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
 use garnshared::error_types::SendableError;
@@ -17,7 +17,6 @@ use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsoc
 use nix::sys::stat::{Mode, SFlag, lstat};
 use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
-use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -52,7 +51,7 @@ impl Runtime<Uninit> {
     }
 
     pub fn init(self) -> Result<Runtime<Ready>, SendableError> {
-        Self::check_privileges()?;
+        self.check_privileges()?;
 
         self.setup_working_dir()?;
 
@@ -69,10 +68,10 @@ impl Runtime<Uninit> {
     }
 
     #[allow(clippy::similar_names)] // uid and gid being similar is fine
-    fn check_privileges() -> Result<(), SendableError> {
+    fn check_privileges(&self) -> Result<(), SendableError> {
         cfg_if! {
             if #[cfg(debug_assertions)] {
-                warn("privilege checks are disabled in debug mode");
+                send_error!(self.error_tx, RuntimeError::PrivilegeChecksDisabled);
                 return Ok(());
             }
         }
@@ -250,10 +249,6 @@ impl Runtime<Uninit> {
 }
 
 impl Runtime<Ready> {
-    pub fn create_log_file(&self, file_name: &str) -> Result<File, SendableError> {
-        File::create(self.working_dir_path.join(file_name)).map_err(Box::from)
-    }
-
     pub fn listen(self) -> Result<Runtime<Listening>, SendableError> {
         // Setup signal handler for graceful shutdown
         // Safety: This is the only write to the static before the signal handler is installed.
@@ -307,7 +302,7 @@ impl Runtime<Ready> {
     extern "C" fn termination_signal_handler(_signal: c_int) {
         // Safety: backed by static's safety invariant
         if unsafe { SHUTDOWN_EVENT_FOR_SIGNAL } == -1 {
-            warn(
+            error_in_brittle_scenario(
                 "Termination requested in an early or invalid state of the program, exiting immediately.",
             );
             // Safety: Potentially ill-formed program states are irrelevant here, because we exit immediately anyway
@@ -351,7 +346,7 @@ impl Drop for Listening {
         let result = self.shutdown_event.write(1);
         if let Err(e) = &result {
             if thread::panicking() {
-                warn(format!("signaling welcome thread failed: {e}").as_str());
+                error_in_brittle_scenario(format!("signaling welcome thread failed: {e}").as_str());
                 return;
             }
             result.unwrap();

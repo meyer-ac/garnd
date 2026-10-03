@@ -1,6 +1,6 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
-use crate::util::warn;
+use crate::util::error_in_brittle_scenario;
 use garnshared::error_types::SendableError;
 use garnshared::linux::traits::ShmCompatible;
 use hashed_type_def::HashedTypeMethods;
@@ -258,12 +258,12 @@ impl Drop for ShmAllocator {
             // SAFETY: addr being a multiple of the page size is guaranteed by mmap, which
             // aligns the memory to page boundaries
             if let Err(e) = unsafe { munmap(page.mem.cast::<c_void>(), self.page_size) } {
-                warn(format!("unmapping of shared memory failed: {e}").as_str());
+                error_in_brittle_scenario(format!("unmapping of shared memory failed: {e}").as_str());
             }
         }
         if let Some(first_panic) = first_panic {
             if std::thread::panicking() {
-                warn("ShmAllocator panicked while destructing");
+                error_in_brittle_scenario("ShmAllocator panicked while destructing");
             } else {
                 resume_unwind(first_panic);
             }
