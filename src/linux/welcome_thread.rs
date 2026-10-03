@@ -14,7 +14,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, mpsc::{self, TryRecvError}};
 use nix::sys::socket::sockopt::PeerCredentials;
 
 #[allow(clippy::needless_pass_by_value)] // This function should take ownership over the welcome socket, it's part of the semantics
@@ -75,14 +75,20 @@ pub fn welcome_thread_main(
             close_env_event
                 .read()
                 .map_or_else(|e| send_error!(error_tx, e), |_| ());
-            let name = match close_env_rx.recv() {
-                Ok(res) => res,
-                Err(e) => {
-                    send_error!(error_tx, e);
-                    return;
-                }
-            };
-            environments.remove(&name);
+            // We don't use try_iter() here because we must distinguish between an empty and a faulty channel
+            // and iter() because we must prevent subtle races arising from the not mutually synced close_env_event and close_env_rx
+            loop {
+                match close_env_rx.try_recv() {
+                    Ok(name) => {
+                        environments.remove(&name);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        send_error!(error_tx, TryRecvError::Disconnected);
+                        return;
+                    }
+                };
+            }
         }
 
         // Handle events on the welcome thread, if there are any

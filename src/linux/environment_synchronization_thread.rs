@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::io::IoSlice;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 macro_rules! report_error_and_close {
     ($e:expr, $name:expr, $error_tx:expr, $close_env_event:expr, $close_env_tx:expr) => {
@@ -162,16 +162,31 @@ fn add_listener(
     epoll: &Epoll,
 ) -> Result<(), Errno> {
     add_listener_event.read()?;
-    let new_listener = add_listener_rx.recv().unwrap();
-    epoll.add(
-        new_listener.as_fd(),
-        #[allow(clippy::cast_sign_loss)]
-        EpollEvent::new(
-            EpollFlags::EPOLLIN | EpollFlags::from_bits_truncate(nix::libc::EPOLLRDHUP),
-            new_listener.as_raw_fd() as u64,
-        ),
-    )?;
-    sockets.insert(new_listener);
+    // We don't use try_iter() here because we must distinguish between an empty and a faulty channel
+    // and iter() because we must prevent subtle races arising from the not mutually synced close_env_event and close_env_rx
+    loop {
+        let recv_res = add_listener_rx.try_recv();
+        match recv_res {
+            Ok(new_listener) => {
+                epoll.add(
+                    new_listener.as_fd(),
+                    #[allow(clippy::cast_sign_loss)]
+                    EpollEvent::new(
+                        EpollFlags::EPOLLIN | EpollFlags::from_bits_truncate(nix::libc::EPOLLRDHUP),
+                        new_listener.as_raw_fd() as u64,
+                    ),
+                )?;
+                sockets.insert(new_listener);
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                // The only way this can happen is if the owning thread delegating new listeners to
+                // this thread has died. This is terrible and means that the program is in an already
+                // unrecoverable state => escalate and panic!
+                Err::<OwnedFd, TryRecvError>(TryRecvError::Disconnected).unwrap();
+            }
+        }
+    }
     Ok(())
 }
 
