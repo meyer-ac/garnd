@@ -11,3 +11,14 @@ impl Display for ShutdownSignal {
 }
 
 impl Error for ShutdownSignal {}
+
+#[derive(Debug)]
+pub struct ReloadRequest {}
+
+impl Display for ReloadRequest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Service reload requested.")
+    }
+}
+
+impl Error for ReloadRequest {}

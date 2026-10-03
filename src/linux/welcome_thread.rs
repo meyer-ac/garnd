@@ -1,8 +1,8 @@
 use crate::linux::environment::Environment;
 use crate::linux::runtime_error::RuntimeError;
 use crate::linux::util::unwrap_or_report_failure;
-use crate::shutdown_signal::ShutdownSignal;
-use crate::{send_all_errors, send_error};
+use crate::shutdown_signal::{ReloadRequest, ShutdownSignal};
+use crate::{constants, send_all_errors, send_error};
 use garnshared::error_types::SendableError;
 use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse, WELCOME_REQUEST_PROTOCOL};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -63,10 +63,18 @@ pub fn welcome_thread_main(
 
         // Graceful shutdown
         if poll_shutdown.any().unwrap_or_default() {
-            shutdown_event
+            let is_reload: bool = shutdown_event
                 .read()
-                .map_or_else(|e| send_error!(error_tx, e), |_| ());
-            send_error!(error_tx, ShutdownSignal {});
+                .map(|i| i == constants::RELOAD_EVENT)
+                .unwrap_or_else(|e| {
+                    send_error!(error_tx, e);
+                    false // If something went wrong here, it is better to shut down completely
+                });
+            if is_reload {
+                send_error!(error_tx, ReloadRequest {});
+            } else {
+                send_error!(error_tx, ShutdownSignal {});
+            }
             return;
         }
 

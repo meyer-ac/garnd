@@ -11,7 +11,7 @@ use nix::libc;
 use nix::libc::_exit;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::prctl::get_no_new_privs;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, Signal, sigaction};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
 use nix::sys::stat::{Mode, SFlag, lstat};
@@ -255,7 +255,7 @@ impl Runtime<Ready> {
         unsafe {
             SHUTDOWN_EVENT_FOR_SIGNAL = self.state_data.shutdown_event.as_raw_fd();
         }
-        // Safety: The signal handler is async safe.
+        // Safety: The signal handlers are async safe.
         unsafe {
             sigaction(
                 Signal::SIGTERM,
@@ -273,6 +273,16 @@ impl Runtime<Ready> {
                     SigHandler::Handler(Self::termination_signal_handler),
                     SaFlags::SA_RESTART,
                     Signal::SIGTERM | Signal::SIGINT,
+                ),
+            )
+        }?;
+        unsafe {
+            sigaction(
+                Signal::SIGHUP,
+                &SigAction::new(
+                    SigHandler::Handler(Self::reload_signal_handler),
+                    SaFlags::SA_RESTART,
+                    SigSet::from(Signal::SIGHUP)
                 ),
             )
         }?;
@@ -300,6 +310,16 @@ impl Runtime<Ready> {
 
     /// This function is async safe.
     extern "C" fn termination_signal_handler(_signal: c_int) {
+        Self::termination_or_reload_handler(false)
+    }
+
+    /// This function is async safe.
+    extern "C" fn reload_signal_handler(_signal: c_int) {
+        Self::termination_or_reload_handler(true)
+    }
+
+    /// This function is async safe
+    extern "C" fn termination_or_reload_handler(is_reload: bool) {
         // Safety: backed by static's safety invariant
         if unsafe { SHUTDOWN_EVENT_FOR_SIGNAL } == -1 {
             error_in_brittle_scenario(
@@ -310,7 +330,7 @@ impl Runtime<Ready> {
                 _exit(-1);
             }
         } else {
-            let buf: i64 = 1;
+            let buf: u64 = if is_reload { constants::RELOAD_EVENT } else { constants::SHUTDOWN_EVENT };
             // Safety: static read operation backed by static's safety invariant;
             // a write operation to an invalid fd cannot cause UB;
             // the value written to it is exactly 8 bytes;
