@@ -91,6 +91,7 @@ dependencies = [
 [[package]]
 name = "garnshared"
 version = "0.1.0"
+source = "git+https://github.com/meyer-ac/garnshared#4f015fa189518ec5ee2276e67b2c587da37e3a70"
 dependencies = [
  "cfg-if",
  "hashed-type-def",

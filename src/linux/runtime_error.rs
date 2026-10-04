@@ -44,7 +44,7 @@ impl fmt::Display for RuntimeError {
             ),
             Self::RunAsWrongGroup => write!(
                 f,
-                "service must be run as user '{}' (real, effective, saved and file system)",
+                "service must be run as group '{}' (real, effective, saved and file system)",
                 constants::GROUP_NAME
             ),
             Self::RunWithRootGroup => write!(

@@ -186,7 +186,7 @@ impl Runtime<Uninit> {
         if owner_group.gid != garn_group.gid {
             return Err(RuntimeError::WorkingDirOwnedByWrongGroup {
                 working_dir: working_dir_str,
-                owner: owner_user.name,
+                owner: owner_group.name,
             }).add_metadata();
         }
 
