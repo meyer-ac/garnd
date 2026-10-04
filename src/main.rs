@@ -45,9 +45,9 @@ fn main() {
 
         while let Ok(err) = error_receiver.recv() {
             let mut shutdown = false;
-            if err.is::<ShutdownSignal>() {
+            if err.error().is::<ShutdownSignal>() {
                 shutdown = true;
-            } else if err.is::<ReloadRequest>() {
+            } else if err.error().is::<ReloadRequest>() {
                 reload_requested = true;
             }
             logger.log(&err);

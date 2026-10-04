@@ -1,7 +1,7 @@
 use crate::join_guard::JoinGuard;
 use crate::linux::environment_synchronization_thread::environment_synchronization_thread_main;
 use crate::util::error_in_brittle_scenario;
-use garnshared::error_types::SendableError;
+use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::os::fd::OwnedFd;
 use std::sync::mpsc::{Receiver, Sender};
@@ -11,7 +11,7 @@ use std::thread;
 pub struct Environment {
     add_listener_event: Arc<EventFd>,
     add_listener_tx: Sender<OwnedFd>,
-    sync_response_rx: Receiver<Result<(), SendableError>>,
+    sync_response_rx: Receiver<Result<(), SendableErrorWithMetadata>>,
     drop_event: Arc<EventFd>,
     _thread: JoinGuard,
 }
@@ -19,21 +19,21 @@ pub struct Environment {
 impl Environment {
     pub fn new(
         name: &str,
-        error_tx: Sender<SendableError>,
+        error_tx: Sender<SendableErrorWithMetadata>,
         close_env_event: Arc<EventFd>,
         close_env_tx: Sender<String>,
-    ) -> Result<Self, SendableError> {
+    ) -> Result<Self, SendableErrorWithMetadata> {
         let name = name.to_owned();
         let add_listener_event = Arc::new(EventFd::from_value_and_flags(
             0,
             EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
-        )?);
+        ).add_metadata()?);
         let (add_listener_tx, add_listener_rx) = mpsc::channel::<OwnedFd>();
-        let (sync_response_tx, sync_response_rx) = mpsc::channel::<Result<(), SendableError>>();
+        let (sync_response_tx, sync_response_rx) = mpsc::channel::<Result<(), SendableErrorWithMetadata>>();
         let drop_event = Arc::new(EventFd::from_value_and_flags(
             0,
             EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
-        )?);
+        ).add_metadata()?);
         let thread_add_listener_event = add_listener_event.clone();
         let thread_drop_event = drop_event.clone();
         let thread = JoinGuard::from(thread::Builder::new().spawn(move || {
@@ -47,7 +47,7 @@ impl Environment {
                 &add_listener_rx,
                 &thread_drop_event,
             );
-        })?);
+        }).add_metadata()?);
         Ok(Self {
             add_listener_event,
             add_listener_tx,
@@ -57,10 +57,10 @@ impl Environment {
         })
     }
 
-    pub fn insert_socket(&mut self, socket: OwnedFd) -> Result<(), SendableError> {
-        self.add_listener_tx.send(socket)?;
-        self.add_listener_event.write(1)?;
-        self.sync_response_rx.recv()?
+    pub fn insert_socket(&mut self, socket: OwnedFd) -> Result<(), SendableErrorWithMetadata> {
+        self.add_listener_tx.send(socket).add_metadata()?;
+        self.add_listener_event.write(1).add_metadata()?;
+        self.sync_response_rx.recv().add_metadata()?
     }
 }
 

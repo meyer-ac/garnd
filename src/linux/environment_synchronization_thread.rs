@@ -2,9 +2,8 @@ use crate::linux::shm_allocator::ShmAllocator;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::{send_all_errors, send_error};
 use garnshared::environment_protocol::{EnvironmentRequest, EnvironmentResponse, ENVIRONMENT_REQUEST_PROTOCOL};
-use garnshared::error_types::SendableError;
+use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
 use garnshared::linux::pthread_mutex::PthreadMutex;
-use nix::errno::Errno;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use nix::sys::eventfd::EventFd;
 use nix::sys::socket::{ControlMessage, MsgFlags, recv, send, sendmsg};
@@ -17,7 +16,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 macro_rules! report_error_and_close {
     ($e:expr, $name:expr, $error_tx:expr, $close_env_event:expr, $close_env_tx:expr) => {
         report_boxed_error_and_close(
-            Box::new($e),
+            $e,
             $name,
             $error_tx,
             $close_env_event,
@@ -32,11 +31,13 @@ macro_rules! pass_result_to_requesting_thread {
             .map(|_| {
                 let _ = $response_tx
                     .send(Ok(()))
+                    .add_metadata()
                     .map_err(|e| send_error!($error_tx, e));
             })
             .map_err(|e| {
                 let _ = $response_tx
-                    .send(Err(Box::new(e)))
+                    .send(Err(e))
+                    .add_metadata()
                     .map_err(|e| send_error!($error_tx, e));
             });
     };
@@ -45,8 +46,8 @@ macro_rules! pass_result_to_requesting_thread {
 #[allow(clippy::too_many_arguments)]
 pub fn environment_synchronization_thread_main(
     name: &str,
-    error_tx: &Sender<SendableError>,
-    sync_response_tx: &Sender<Result<(), SendableError>>,
+    error_tx: &Sender<SendableErrorWithMetadata>,
+    sync_response_tx: &Sender<Result<(), SendableErrorWithMetadata>>,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
     add_listener_event: &Arc<EventFd>,
@@ -63,7 +64,7 @@ pub fn environment_synchronization_thread_main(
         }
     };
 
-    let epoll = match Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC) {
+    let epoll = match Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).add_metadata() {
         Ok(res) => res,
         Err(e) => {
             report_error_and_close!(e, name, &error_tx, &close_env_event, &close_env_tx);
@@ -79,7 +80,7 @@ pub fn environment_synchronization_thread_main(
             event.as_fd(),
             #[allow(clippy::cast_sign_loss)]
             EpollEvent::new(EpollFlags::EPOLLIN, event.as_raw_fd() as u64),
-        ) {
+        ).add_metadata() {
             report_error_and_close!(e, name, &error_tx, &close_env_event, &close_env_tx);
             return;
         }
@@ -89,7 +90,7 @@ pub fn environment_synchronization_thread_main(
     let mut break_loop = false;
     while !break_loop {
         let mut events = vec![EpollEvent::empty(); sockets.len() + 2];
-        let num_events = match epoll.wait(&mut events, EpollTimeout::NONE) {
+        let num_events = match epoll.wait(&mut events, EpollTimeout::NONE).add_metadata() {
             Ok(res) => res,
             Err(e) => {
                 report_error_and_close!(e, name, &error_tx, &close_env_event, &close_env_tx);
@@ -113,6 +114,7 @@ pub fn environment_synchronization_thread_main(
             if event.data() == drop_event.as_raw_fd() as u64 {
                 drop_event
                     .read()
+                    .add_metadata()
                     .map_or_else(|e| send_error!(error_tx, e), |_| ());
                 break_loop = true;
                 break;
@@ -160,8 +162,8 @@ fn add_listener(
     add_listener_rx: &Receiver<OwnedFd>,
     sockets: &mut SocketSet,
     epoll: &Epoll,
-) -> Result<(), Errno> {
-    add_listener_event.read()?;
+) -> Result<(), SendableErrorWithMetadata> {
+    add_listener_event.read().add_metadata()?;
     // We don't use try_iter() here because we must distinguish between an empty and a faulty channel
     // and iter() because we must prevent subtle races arising from the not mutually synced close_env_event and close_env_rx
     loop {
@@ -175,7 +177,7 @@ fn add_listener(
                         EpollFlags::EPOLLIN | EpollFlags::from_bits_truncate(nix::libc::EPOLLRDHUP),
                         new_listener.as_raw_fd() as u64,
                     ),
-                )?;
+                ).add_metadata()?;
                 sockets.insert(new_listener);
             }
             Err(TryRecvError::Empty) => break,
@@ -191,38 +193,41 @@ fn add_listener(
     Ok(())
 }
 
-fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Vec<SendableError>> {
+fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Vec<SendableErrorWithMetadata>> {
     let mut buffer = vec![0u8; ENVIRONMENT_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
-    recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
+    recv(raw_fd, &mut buffer, MsgFlags::empty()).add_metadata().map_err(|e| vec![e])?;
 
-    let request_str = match str::from_utf8(&buffer) {
+    let request_str = match str::from_utf8(&buffer).add_metadata() {
         Ok(res) => res,
         Err(e) => {
-            let mut errors = vec![Box::from(e)];
+            let mut errors = vec![e];
             let Ok(response) = EnvironmentResponse::MalformedRequest
                 .serialize()
-                .map_err(|e| errors.push(Box::from(e)))
+                .add_metadata()
+                .map_err(|e| errors.push(e))
             else {
                 return Err(errors);
             };
-            send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+            send(raw_fd, response.as_bytes(), MsgFlags::empty()).add_metadata()
+                .map_or_else(|e| errors.push(e), |_| ());
             return Err(errors);
         }
     };
 
-    let request = match EnvironmentRequest::deserialize(request_str) {
+    let request = match EnvironmentRequest::deserialize(request_str).add_metadata() {
         Ok(res) => res,
         Err(e) => {
-            let mut errors = vec![Box::from(e)];
+            let mut errors = vec![e];
             let Ok(response) = EnvironmentResponse::MalformedRequest
                 .serialize()
-                .map_err(|e| errors.push(Box::from(e)))
+                .add_metadata()
+                .map_err(|e| errors.push(e))
             else {
                 return Err(errors);
             };
             send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+                .add_metadata()
+                .map_or_else(|e| errors.push(e), |_| ());
             return Err(errors);
         }
     };
@@ -234,7 +239,7 @@ fn handle_open_mutex(
     name: &str,
     shm: &mut ShmAllocator,
     raw_fd: RawFd,
-) -> Result<(), Vec<SendableError>> {
+) -> Result<(), Vec<SendableErrorWithMetadata>> {
     let shm_location = match unwrap_or_report_failure!(
         shm.find_resource::<PthreadMutex>(name),
         raw_fd,
@@ -255,8 +260,7 @@ fn handle_open_mutex(
     // Pass shared memory page to client
     let response = unwrap_or_report_failure!(
         EnvironmentResponse::OpenMutexOk(shm_location.page, shm_location.offset)
-            .serialize()
-            .map_err(Box::from),
+            .serialize().add_metadata(),
         raw_fd,
         EnvironmentResponse
     );
@@ -265,7 +269,8 @@ fn handle_open_mutex(
     let cmsg = ControlMessage::ScmRights(&fds);
     sendmsg::<()>(raw_fd, &iov, &[cmsg], MsgFlags::empty(), None)
         .map(|_| ())
-        .map_err(|e| -> Vec<SendableError> { vec![Box::new(e)] })?;
+        .add_metadata()
+        .map_err(|e| { vec![e] })?;
 
     Ok(())
 }
@@ -274,14 +279,16 @@ fn announce_env_close(
     name: &str,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
-) -> Result<(), Vec<SendableError>> {
-    let mut errors: Vec<SendableError> = vec![];
+) -> Result<(), Vec<SendableErrorWithMetadata>> {
+    let mut errors: Vec<SendableErrorWithMetadata> = vec![];
     close_env_tx
         .send(name.to_owned())
-        .unwrap_or_else(|e| errors.push(Box::new(e)));
+        .add_metadata()
+        .unwrap_or_else(|e| errors.push(e));
     close_env_event
         .write(1)
-        .map_or_else(|e| errors.push(Box::new(e)), |_| ());
+        .add_metadata()
+        .map_or_else(|e| errors.push(e), |_| ());
     if errors.is_empty() {
         Ok(())
     } else {
@@ -290,16 +297,17 @@ fn announce_env_close(
 }
 
 fn report_boxed_error_and_close(
-    e: SendableError,
+    e: SendableErrorWithMetadata,
     name: &str,
-    error_tx: &Sender<SendableError>,
+    error_tx: &Sender<SendableErrorWithMetadata>,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
 ) {
-    let mut errors: Vec<SendableError> = vec![];
+    let mut errors: Vec<SendableErrorWithMetadata> = vec![];
     error_tx
         .send(e)
-        .unwrap_or_else(|e| errors.push(Box::new(e)));
+        .add_metadata()
+        .unwrap_or_else(|e| errors.push(e));
     announce_env_close(name, close_env_event, close_env_tx)
         .unwrap_or_else(|ref mut es| errors.append(es));
     send_all_errors!(error_tx, errors);

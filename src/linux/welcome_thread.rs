@@ -3,23 +3,27 @@ use crate::linux::runtime_error::RuntimeError;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::shutdown_signal::{ReloadRequest, ShutdownSignal};
 use crate::{send_all_errors, send_error};
-use garnshared::error_types::SendableError;
-use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse, WELCOME_REQUEST_PROTOCOL};
+use garnshared::add_metadata_to_error;
+use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
+use garnshared::welcome_protocol::{WELCOME_REQUEST_PROTOCOL, WelcomeRequest, WelcomeResponse};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use nix::sys::socket::{accept, getsockopt, listen, recv, send, Backlog, MsgFlags};
+use nix::sys::socket::sockopt::PeerCredentials;
+use nix::sys::socket::{Backlog, MsgFlags, accept, getsockopt, listen, recv, send};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, mpsc::{self, TryRecvError}};
-use nix::sys::socket::sockopt::PeerCredentials;
+use std::sync::{
+    Arc,
+    mpsc::{self, TryRecvError},
+};
 
 #[allow(clippy::needless_pass_by_value)] // This function should take ownership over the welcome socket, it's part of the semantics
 pub fn welcome_thread_main(
-    error_tx: &Sender<SendableError>,
+    error_tx: &Sender<SendableErrorWithMetadata>,
     welcome_socket: OwnedFd,
     shutdown_event: &Arc<EventFd>,
     reload_event: &Arc<EventFd>,
@@ -29,7 +33,9 @@ pub fn welcome_thread_main(
     // Environment threads trigger this event to notify the owner (this thread) about
     // a graceful shutdown
     let close_env_event = Arc::new(
-        match EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK) {
+        match EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .add_metadata()
+        {
             Ok(res) => res,
             Err(e) => {
                 send_error!(error_tx, e);
@@ -41,7 +47,7 @@ pub fn welcome_thread_main(
     // so that the owner (this thread) can remove the environment
     let (close_env_tx, close_env_rx) = mpsc::channel::<String>();
 
-    if let Err(e) = listen(&welcome_socket.as_fd(), Backlog::MAXCONN) {
+    if let Err(e) = listen(&welcome_socket.as_fd(), Backlog::MAXCONN).add_metadata() {
         send_error!(error_tx, e);
         return;
     }
@@ -56,7 +62,7 @@ pub fn welcome_thread_main(
             PollFd::new(welcome_socket.as_fd(), PollFlags::POLLIN),
         ];
 
-        if let Err(e) = poll(poll_fds, PollTimeout::NONE) {
+        if let Err(e) = poll(poll_fds, PollTimeout::NONE).add_metadata() {
             send_error!(error_tx, e);
             return;
         }
@@ -67,9 +73,9 @@ pub fn welcome_thread_main(
         if poll_shutdown.any().unwrap_or_default() {
             shutdown_event
                 .read()
-                .map_or_else(|e|
-                    send_error!(error_tx, e), |_| ());
-            send_error!(error_tx, ShutdownSignal {});
+                .add_metadata()
+                .map_or_else(|e| send_error!(error_tx, e), |_| ());
+            send_error!(error_tx, add_metadata_to_error!(ShutdownSignal {}));
             return;
         }
 
@@ -77,9 +83,9 @@ pub fn welcome_thread_main(
         if poll_reload.any().unwrap_or_default() {
             reload_event
                 .read()
-                .map_or_else(|e|
-                                 send_error!(error_tx, e), |_| ());
-            send_error!(error_tx, ReloadRequest {});
+                .add_metadata()
+                .map_or_else(|e| send_error!(error_tx, e), |_| ());
+            send_error!(error_tx, add_metadata_to_error!(ReloadRequest {}));
             return;
         }
 
@@ -87,6 +93,7 @@ pub fn welcome_thread_main(
         if poll_close_env.any().unwrap_or_default() {
             close_env_event
                 .read()
+                .add_metadata()
                 .map_or_else(|e| send_error!(error_tx, e), |_| ());
             // We don't use try_iter() here because we must distinguish between an empty and a faulty channel
             // and iter() because we must prevent subtle races arising from the not mutually synced close_env_event and close_env_rx
@@ -97,7 +104,7 @@ pub fn welcome_thread_main(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        send_error!(error_tx, TryRecvError::Disconnected);
+                        send_error!(error_tx, add_metadata_to_error!(TryRecvError::Disconnected));
                         return;
                     }
                 }
@@ -110,9 +117,12 @@ pub fn welcome_thread_main(
         }
         // Did the welcome socket break down for some reason?
         if !poll_welcome.revents().unwrap().contains(PollFlags::POLLIN) {
-            send_error!(error_tx, RuntimeError::WelcomeSocketFailed);
+            send_error!(
+                error_tx,
+                add_metadata_to_error!(RuntimeError::WelcomeSocketFailed)
+            );
             // We can't possibly recover from this failure => shutdown
-            send_error!(error_tx, ShutdownSignal {});
+            send_error!(error_tx, add_metadata_to_error!(ShutdownSignal {}));
             continue;
         }
 
@@ -141,49 +151,59 @@ pub fn welcome_thread_main(
 
 fn receive_and_parse_request(
     welcome_socket: BorrowedFd,
-) -> Result<(OwnedFd, WelcomeRequest), Vec<SendableError>> {
-    let raw_fd = accept(welcome_socket.as_raw_fd()).map_err(|e| vec![Box::from(e)])?;
+) -> Result<(OwnedFd, WelcomeRequest), Vec<SendableErrorWithMetadata>> {
+    let raw_fd = accept(welcome_socket.as_raw_fd())
+        .add_metadata()
+        .map_err(|e| vec![e])?;
     // SAFETY: res is open and suitable for taking ownership; the raw fd is immediately discarded
     let client_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
     // Ignore all requests from root. Don't even answer then, just don't interact at all with any
     // root process for security reasons.
-    let creds = getsockopt(&client_fd.as_fd(), PeerCredentials).map_err(|e| vec![Box::from(e)])?;
+    let creds = getsockopt(&client_fd.as_fd(), PeerCredentials)
+        .add_metadata()
+        .map_err(|e| vec![e])?;
     if creds.uid() == 0 {
-        return Err(vec![Box::new(IgnoredRootRequestError {})]);
+        return Err(vec![add_metadata_to_error!(IgnoredRootRequestError {})]);
     }
 
     let mut buffer = vec![0u8; WELCOME_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
-    recv(raw_fd, &mut buffer, MsgFlags::empty()).map_err(|e| vec![Box::from(e)])?;
+    recv(raw_fd, &mut buffer, MsgFlags::empty())
+        .add_metadata()
+        .map_err(|e| vec![e])?;
 
-    let request_str = match str::from_utf8(&buffer) {
+    let request_str = match str::from_utf8(&buffer).add_metadata() {
         Ok(res) => res,
         Err(e) => {
-            let mut errors = vec![Box::from(e)];
+            let mut errors = vec![e];
             let Ok(response) = WelcomeResponse::MalformedRequest
                 .serialize()
-                .map_err(|e| errors.push(Box::from(e)))
+                .add_metadata()
+                .map_err(|e| errors.push(e))
             else {
                 return Err(errors);
             };
             send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+                .add_metadata()
+                .map_or_else(|e| errors.push(e), |_| ());
             return Err(errors);
         }
     };
 
-    let request = match WelcomeRequest::deserialize(request_str) {
+    let request = match WelcomeRequest::deserialize(request_str).add_metadata() {
         Ok(res) => res,
         Err(e) => {
-            let mut errors = vec![Box::from(e)];
+            let mut errors = vec![e];
             let Ok(response) = WelcomeResponse::MalformedRequest
                 .serialize()
-                .map_err(|e| errors.push(Box::from(e)))
+                .add_metadata()
+                .map_err(|e| errors.push(e))
             else {
                 return Err(errors);
             };
             send(raw_fd, response.as_bytes(), MsgFlags::empty())
-                .map_or_else(|e| errors.push(Box::from(e)), |_| ());
+                .add_metadata()
+                .map_or_else(|e| errors.push(e), |_| ());
             return Err(errors);
         }
     };
@@ -195,16 +215,15 @@ fn receive_and_parse_request(
 fn handle_open_environment(
     env_name: &str,
     environments: &mut HashMap<String, Environment>,
-    error_tx: &Sender<SendableError>,
+    error_tx: &Sender<SendableErrorWithMetadata>,
     client_fd: OwnedFd,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
-) -> Result<(), Vec<SendableError>> {
+) -> Result<(), Vec<SendableErrorWithMetadata>> {
     let passed_off_fd = unwrap_or_report_failure!(
-        nix::unistd::dup(client_fd.as_fd()),
+        nix::unistd::dup(client_fd.as_fd()).add_metadata(),
         client_fd.as_raw_fd(),
-        WelcomeResponse,
-        Box::new
+        WelcomeResponse
     );
     match environments.entry(env_name.to_owned()) {
         Entry::Vacant(entry) => {
@@ -236,17 +255,17 @@ fn handle_open_environment(
     let response = unwrap_or_report_failure!(
         WelcomeResponse::OpenEnvironmentOk
             .serialize()
-            .map_err(Box::from),
+            .add_metadata(),
         client_fd.as_raw_fd(),
         WelcomeResponse
     );
-    if let Err(e) = send(
+    send(
         client_fd.as_raw_fd(),
         response.as_bytes(),
         MsgFlags::empty(),
-    ) {
-        return Err(vec![Box::new(e)]);
-    }
+    )
+    .add_metadata()
+    .map_err(|e| vec![e])?;
     Ok(())
 }
 
@@ -255,7 +274,10 @@ struct IgnoredRootRequestError {}
 
 impl Display for IgnoredRootRequestError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a root process tried to contact this service; ignored the request")
+        write!(
+            f,
+            "a root process tried to contact this service; ignored the request"
+        )
     }
 }
 

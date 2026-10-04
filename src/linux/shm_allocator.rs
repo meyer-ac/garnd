@@ -1,7 +1,7 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
 use crate::util::error_in_brittle_scenario;
-use garnshared::error_types::SendableError;
+use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
 use garnshared::linux::traits::ShmCompatible;
 use hashed_type_def::HashedTypeMethods;
 use nix::fcntl::{FcntlArg, SealFlag, fcntl};
@@ -47,11 +47,11 @@ pub struct ShmAllocator {
 }
 
 impl ShmAllocator {
-    pub fn new() -> Result<Self, SendableError> {
-        let page_size = match sysconf(SysconfVar::PAGE_SIZE) {
-            Ok(Some(0) | None) => return Err(Box::new(RuntimeError::GetPageSizeFailed)),
+    pub fn new() -> Result<Self, SendableErrorWithMetadata> {
+        let page_size = match sysconf(SysconfVar::PAGE_SIZE).add_metadata() {
+            Ok(Some(0) | None) => return Err(RuntimeError::GetPageSizeFailed).add_metadata(),
             Ok(Some(res)) => usize::try_from(res).unwrap(), // non-negative according to the Linux kernel
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => return Err(e),
         };
 
         Ok(Self {
@@ -66,32 +66,32 @@ impl ShmAllocator {
         &mut self,
         name: &str,
         placement_constructor: F,
-    ) -> Result<ClientResourceLocation, SendableError>
+    ) -> Result<ClientResourceLocation, SendableErrorWithMetadata>
     where
         T: ShmCompatible,
-        F: FnOnce(Pin<&mut MaybeUninit<T>>) -> Result<(), SendableError>,
+        F: FnOnce(Pin<&mut MaybeUninit<T>>) -> Result<(), SendableErrorWithMetadata>,
     {
         if self.resources.contains_key(name) {
-            return Err(Box::new(RuntimeError::ResourceNameAlreadyInUse {
+            return Err(RuntimeError::ResourceNameAlreadyInUse {
                 resource_name: name.to_owned(),
-            }));
+            }).add_metadata();
         }
 
         let size = size_of::<T>();
         let align = align_of::<T>();
 
         if size > self.page_size {
-            return Err(Box::new(RuntimeError::ResourceTooLargeForPage {
+            return Err(RuntimeError::ResourceTooLargeForPage {
                 page_size: self.page_size,
                 size,
-            }));
+            }).add_metadata();
         }
 
         if align > self.page_size {
-            return Err(Box::new(RuntimeError::ResourceAlignmentLargerThanPage {
+            return Err(RuntimeError::ResourceAlignmentLargerThanPage {
                 page_size: self.page_size,
                 alignment: align,
-            }));
+            }).add_metadata();
         }
 
         if self.pages.is_empty() {
@@ -162,15 +162,15 @@ impl ShmAllocator {
     pub fn find_resource<T: ShmCompatible>(
         &self,
         name: &str,
-    ) -> Result<Option<ClientResourceLocation>, SendableError> {
+    ) -> Result<Option<ClientResourceLocation>, SendableErrorWithMetadata> {
         let Some(resource_metadata) = self.resources.get(name) else {
             return Ok(None);
         };
         if resource_metadata.type_id != T::type_uuid() {
-            return Err(Box::new(RuntimeError::ResourceTypeMismatch {
+            return Err(RuntimeError::ResourceTypeMismatch {
                 requested_type: any::type_name::<T>(),
                 resource_type: "<unavailable at runtime>",
-            }));
+            }).add_metadata();
         }
         Ok(Some(ClientResourceLocation {
             page: resource_metadata.page,
@@ -179,20 +179,20 @@ impl ShmAllocator {
         }))
     }
 
-    fn create_new_page(&mut self) -> Result<(), SendableError> {
+    fn create_new_page(&mut self) -> Result<(), SendableErrorWithMetadata> {
         let shm_fd = memfd_create(
             constants::SHM_FILE_NAME,
             MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
-        )?;
+        ).add_metadata()?;
 
-        ftruncate(shm_fd.as_fd(), off_t::try_from(self.page_size)?)?;
+        ftruncate(shm_fd.as_fd(), off_t::try_from(self.page_size).add_metadata()?).add_metadata()?;
 
         fcntl(
             shm_fd.as_fd(),
             FcntlArg::F_ADD_SEALS(
                 SealFlag::F_SEAL_SEAL | SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_GROW,
             ),
-        )?;
+        ).add_metadata()?;
 
         // SAFETY: length is guaranteed to be non-zero in Self::new(),
         // prot and flags are only passed valid flags,
@@ -215,7 +215,7 @@ impl ShmAllocator {
                 mem: res.cast::<u8>(),
             });
         })
-        .map_err(Box::from)
+        .add_metadata()
     }
 
     fn get_aligned_free_pointer(&self, size: usize, align: usize) -> Option<usize> {

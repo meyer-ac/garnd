@@ -23,18 +23,11 @@ pub fn error_in_brittle_scenario(msg: &str) {
 }
 
 #[macro_export]
-macro_rules! send_boxed_error {
-    ($error_tx:expr, $err:expr) => {
-        if $error_tx.send($err).is_err() {
-            panic!("Error propagation channel broke down unexpectedly.")
-        }
-    };
-}
-
-#[macro_export]
 macro_rules! send_error {
     ($error_tx:expr, $err:expr) => {
-        $crate::send_boxed_error!($error_tx, Box::new($err))
+        if $error_tx.send($err).is_err() {
+            ::std::panic!("Error propagation channel broke down unexpectedly.")
+        }
     };
 }
 
@@ -42,7 +35,7 @@ macro_rules! send_error {
 macro_rules! send_all_errors {
     ($error_tx:expr, $errs:expr) => {
         for err in $errs {
-            $crate::send_boxed_error!($error_tx, err)
+            $crate::send_error!($error_tx, err)
         }
     };
 }

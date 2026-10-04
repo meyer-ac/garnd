@@ -1,19 +1,24 @@
 macro_rules! unwrap_or_report_failure {
-    ($expr:expr, $client_fd:expr, $response_type:ident, $err_map:expr) => {
+    ($expr:expr, $client_fd:expr, $response_type:ident) => {
         match $expr {
-            Ok(res) => res,
-            Err(e) => {
-                let mut errors: Vec<SendableError> = vec![$err_map(e)];
+            ::std::result::Result::Ok(res) => res,
+            ::std::result::Result::Err(e) => {
+                let mut errors: ::std::vec::Vec<
+                    ::garnshared::error_types::SendableErrorWithMetadata,
+                > = ::std::vec![e];
                 let response = $response_type::serialize_internal_error();
-                if let Err(e) = send($client_fd, response.as_bytes(), MsgFlags::empty()) {
-                    errors.push(Box::new(e));
+                if let ::std::result::Result::Err(e) = ::nix::sys::socket::send(
+                    $client_fd,
+                    response.as_bytes(),
+                    ::nix::sys::socket::MsgFlags::empty(),
+                )
+                .add_metadata()
+                {
+                    errors.push(e);
                 }
-                return Err(errors);
+                return ::std::result::Result::Err(errors);
             }
         }
-    };
-    ($expr:expr, $client_fd:expr, $response_type:ident) => {
-        unwrap_or_report_failure!($expr, $client_fd, $response_type, (|x| x))
     };
 }
 
