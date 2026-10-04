@@ -1,8 +1,8 @@
 use super::runtime_error::RuntimeError;
-use crate::{constants, send_error};
 use crate::join_guard::JoinGuard;
 use crate::linux::welcome_thread;
 use crate::util::error_in_brittle_scenario;
+use crate::{constants, send_error};
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
 use garnshared::error_types::SendableError;
@@ -11,7 +11,7 @@ use nix::libc;
 use nix::libc::_exit;
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use nix::sys::prctl::get_no_new_privs;
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
 use nix::sys::stat::{Mode, SFlag, lstat};
@@ -23,10 +23,11 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::{fs, thread};
 
-/// Only used for the termination signal handler, NOWHERE ELSE!
+/// Only used for the termination and reload signal handlers, NOWHERE ELSE!
 /// # SAFETY
-/// Only written to once before the signal handler is installed.
+/// Each only written to once before the signal handler is installed.
 static mut SHUTDOWN_EVENT_FOR_SIGNAL: c_int = -1;
+static mut RELOAD_EVENT_FOR_SIGNAL: c_int = -1;
 
 pub struct Runtime<S: State> {
     error_tx: Sender<SendableError>,
@@ -55,7 +56,7 @@ impl Runtime<Uninit> {
 
         self.setup_working_dir()?;
 
-        let (welcome_socket, shutdown_event) = Self::setup_socket()?;
+        let (welcome_socket, shutdown_event, reload_event) = Self::setup_socket()?;
 
         Ok(Runtime {
             error_tx: self.error_tx,
@@ -63,6 +64,7 @@ impl Runtime<Uninit> {
             state_data: Ready {
                 welcome_socket,
                 shutdown_event: Arc::new(shutdown_event),
+                reload_event: Arc::new(reload_event),
             },
         })
     }
@@ -206,7 +208,7 @@ impl Runtime<Uninit> {
         Ok(())
     }
 
-    fn setup_socket() -> Result<(OwnedFd, EventFd), SendableError> {
+    fn setup_socket() -> Result<(OwnedFd, EventFd, EventFd), SendableError> {
         let welcome_socket = socket(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -244,16 +246,26 @@ impl Runtime<Uninit> {
             Err(e) => return Err(Box::new(e)),
         };
 
-        Ok((welcome_socket, shutdown_event))
+        let reload_event = match EventFd::from_value_and_flags(
+            0,
+            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+        ) {
+            Ok(res) => res,
+            Err(e) => return Err(Box::new(e)),
+        };
+
+        Ok((welcome_socket, shutdown_event, reload_event))
     }
 }
 
 impl Runtime<Ready> {
     pub fn listen(self) -> Result<Runtime<Listening>, SendableError> {
-        // Setup signal handler for graceful shutdown
-        // Safety: This is the only write to the static before the signal handler is installed.
+        // Setup signal handlers for graceful shutdown and reload
+        // Safety: This is the only write to the statics before the signal handlers are installed.
         unsafe {
             SHUTDOWN_EVENT_FOR_SIGNAL = self.state_data.shutdown_event.as_raw_fd();
+        }unsafe {
+            RELOAD_EVENT_FOR_SIGNAL = self.state_data.reload_event.as_raw_fd();
         }
         // Safety: The signal handlers are async safe.
         unsafe {
@@ -291,11 +303,12 @@ impl Runtime<Ready> {
         let error_tx = self.error_tx.clone();
         let welcome_socket = self.state_data.welcome_socket;
         let shutdown_event = Arc::clone(&self.state_data.shutdown_event);
+        let reload_event = Arc::clone(&self.state_data.reload_event);
         //let welcome_thread = thread::spawn(move || {
         //    welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
         //});
         let welcome_thread = JoinGuard::from(thread::Builder::new().spawn(move || {
-            welcome_thread::welcome_thread_main(&error_tx, welcome_socket, &shutdown_event);
+            welcome_thread::welcome_thread_main(&error_tx, welcome_socket, &shutdown_event, &reload_event);
         })?);
 
         Ok(Runtime {
@@ -310,38 +323,49 @@ impl Runtime<Ready> {
 
     /// This function is async safe.
     extern "C" fn termination_signal_handler(_signal: c_int) {
-        Self::termination_or_reload_handler(false)
+        Self::termination_or_reload_handler(false);
     }
 
     /// This function is async safe.
     extern "C" fn reload_signal_handler(_signal: c_int) {
-        Self::termination_or_reload_handler(true)
+        Self::termination_or_reload_handler(true);
     }
 
     /// This function is async safe
     extern "C" fn termination_or_reload_handler(is_reload: bool) {
-        // Safety: backed by static's safety invariant
-        if unsafe { SHUTDOWN_EVENT_FOR_SIGNAL } == -1 {
-            error_in_brittle_scenario(
-                "Termination requested in an early or invalid state of the program, exiting immediately.",
-            );
-            // Safety: Potentially ill-formed program states are irrelevant here, because we exit immediately anyway
-            unsafe {
-                _exit(-1);
+        let fd;
+        if is_reload {
+            // Safety: static read operation backed by static's safety invariant;
+            fd = unsafe { RELOAD_EVENT_FOR_SIGNAL };
+            if fd == -1 {
+                error_in_brittle_scenario(
+                    "Reload requested in an early or severely invalid state of the program, continuing.",
+                );
+                return;
             }
         } else {
-            let buf: u64 = if is_reload { constants::RELOAD_EVENT } else { constants::SHUTDOWN_EVENT };
             // Safety: static read operation backed by static's safety invariant;
-            // a write operation to an invalid fd cannot cause UB;
-            // the value written to it is exactly 8 bytes;
-            // `write` is async safe.
-            unsafe {
-                let _ = libc::write(
-                    SHUTDOWN_EVENT_FOR_SIGNAL,
-                    (&raw const buf).cast::<libc::c_void>(),
-                    size_of_val(&buf),
+            fd = unsafe { SHUTDOWN_EVENT_FOR_SIGNAL };
+            if fd == -1 {
+                error_in_brittle_scenario(
+                    "Termination requested in an early or severely invalid state of the program, exiting.",
                 );
+                // Safety: Potentially ill-formed program states are irrelevant here, because we exit immediately anyway
+                unsafe {
+                    _exit(-1);
+                }
             }
+        }
+        let buf = 1u64;
+        // Safety: a write operation to an invalid fd cannot cause UB;
+        // the value written to it is exactly 8 bytes;
+        // `write` is async safe.
+        unsafe {
+            let _ = libc::write(
+                fd,
+                (&raw const buf).cast::<libc::c_void>(),
+                size_of_val(&buf),
+            );
         }
     }
 }
@@ -351,6 +375,7 @@ pub struct Uninit {}
 pub struct Ready {
     welcome_socket: OwnedFd,
     shutdown_event: Arc<EventFd>,
+    reload_event: Arc<EventFd>,
 }
 pub struct Listening {
     _welcome_thread: JoinGuard,

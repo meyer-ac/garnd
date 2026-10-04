@@ -2,7 +2,7 @@ use crate::linux::environment::Environment;
 use crate::linux::runtime_error::RuntimeError;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::shutdown_signal::{ReloadRequest, ShutdownSignal};
-use crate::{constants, send_all_errors, send_error};
+use crate::{send_all_errors, send_error};
 use garnshared::error_types::SendableError;
 use garnshared::welcome_protocol::{WelcomeRequest, WelcomeResponse, WELCOME_REQUEST_PROTOCOL};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -22,6 +22,7 @@ pub fn welcome_thread_main(
     error_tx: &Sender<SendableError>,
     welcome_socket: OwnedFd,
     shutdown_event: &Arc<EventFd>,
+    reload_event: &Arc<EventFd>,
 ) {
     // Initialization
     let mut environments = HashMap::new();
@@ -50,6 +51,7 @@ pub fn welcome_thread_main(
         // Wait for events
         let poll_fds = &mut [
             PollFd::new(shutdown_event.as_fd(), PollFlags::POLLIN),
+            PollFd::new(reload_event.as_fd(), PollFlags::POLLIN),
             PollFd::new(close_env_event.as_fd(), PollFlags::POLLIN),
             PollFd::new(welcome_socket.as_fd(), PollFlags::POLLIN),
         ];
@@ -59,22 +61,25 @@ pub fn welcome_thread_main(
             return;
         }
 
-        let [poll_shutdown, poll_close_env, poll_welcome] = &*poll_fds;
+        let [poll_shutdown, poll_reload, poll_close_env, poll_welcome] = &*poll_fds;
 
         // Graceful shutdown
         if poll_shutdown.any().unwrap_or_default() {
-            let is_reload: bool = shutdown_event
+            shutdown_event
                 .read()
-                .map(|i| i == constants::RELOAD_EVENT)
-                .unwrap_or_else(|e| {
-                    send_error!(error_tx, e);
-                    false // If something went wrong here, it is better to shut down completely
-                });
-            if is_reload {
-                send_error!(error_tx, ReloadRequest {});
-            } else {
-                send_error!(error_tx, ShutdownSignal {});
-            }
+                .map_or_else(|e|
+                    send_error!(error_tx, e), |_| ());
+            send_error!(error_tx, ShutdownSignal {});
+            return;
+        }
+
+        // Service reload
+        if poll_reload.any().unwrap_or_default() {
+            reload_event
+                .read()
+                .map_or_else(|e|
+                                 send_error!(error_tx, e), |_| ());
+            send_error!(error_tx, ReloadRequest {});
             return;
         }
 
