@@ -2,7 +2,7 @@ use crate::linux::shm_allocator::ShmAllocator;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::{send_all_errors, send_error};
 use garnshared::environment_protocol::{EnvironmentRequest, EnvironmentResponse, ENVIRONMENT_REQUEST_PROTOCOL};
-use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
+use garnshared::error_types::{ResultMetadata, DetailedError};
 use garnshared::linux::pthread_mutex::PthreadMutex;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use nix::sys::eventfd::EventFd;
@@ -46,8 +46,8 @@ macro_rules! pass_result_to_requesting_thread {
 #[allow(clippy::too_many_arguments)]
 pub fn environment_synchronization_thread_main(
     name: &str,
-    error_tx: &Sender<SendableErrorWithMetadata>,
-    sync_response_tx: &Sender<Result<(), SendableErrorWithMetadata>>,
+    error_tx: &Sender<DetailedError>,
+    sync_response_tx: &Sender<Result<(), DetailedError>>,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
     add_listener_event: &Arc<EventFd>,
@@ -162,7 +162,7 @@ fn add_listener(
     add_listener_rx: &Receiver<OwnedFd>,
     sockets: &mut SocketSet,
     epoll: &Epoll,
-) -> Result<(), SendableErrorWithMetadata> {
+) -> Result<(), DetailedError> {
     add_listener_event.read().add_metadata()?;
     // We don't use try_iter() here because we must distinguish between an empty and a faulty channel
     // and iter() because we must prevent subtle races arising from the not mutually synced close_env_event and close_env_rx
@@ -193,7 +193,7 @@ fn add_listener(
     Ok(())
 }
 
-fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Vec<SendableErrorWithMetadata>> {
+fn receive_and_parse_request(raw_fd: RawFd) -> Result<EnvironmentRequest, Vec<DetailedError>> {
     let mut buffer = vec![0u8; ENVIRONMENT_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
     recv(raw_fd, &mut buffer, MsgFlags::empty()).add_metadata().map_err(|e| vec![e])?;
 
@@ -239,7 +239,7 @@ fn handle_open_mutex(
     name: &str,
     shm: &mut ShmAllocator,
     raw_fd: RawFd,
-) -> Result<(), Vec<SendableErrorWithMetadata>> {
+) -> Result<(), Vec<DetailedError>> {
     let shm_location = match unwrap_or_report_failure!(
         shm.find_resource::<PthreadMutex>(name),
         raw_fd,
@@ -279,8 +279,8 @@ fn announce_env_close(
     name: &str,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
-) -> Result<(), Vec<SendableErrorWithMetadata>> {
-    let mut errors: Vec<SendableErrorWithMetadata> = vec![];
+) -> Result<(), Vec<DetailedError>> {
+    let mut errors: Vec<DetailedError> = vec![];
     close_env_tx
         .send(name.to_owned())
         .add_metadata()
@@ -297,13 +297,13 @@ fn announce_env_close(
 }
 
 fn report_boxed_error_and_close(
-    e: SendableErrorWithMetadata,
+    e: DetailedError,
     name: &str,
-    error_tx: &Sender<SendableErrorWithMetadata>,
+    error_tx: &Sender<DetailedError>,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
 ) {
-    let mut errors: Vec<SendableErrorWithMetadata> = vec![];
+    let mut errors: Vec<DetailedError> = vec![];
     error_tx
         .send(e)
         .add_metadata()

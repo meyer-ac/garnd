@@ -4,7 +4,7 @@ macro_rules! unwrap_or_report_failure {
             ::std::result::Result::Ok(res) => res,
             ::std::result::Result::Err(e) => {
                 let mut errors: ::std::vec::Vec<
-                    ::garnshared::error_types::SendableErrorWithMetadata,
+                    ::garnshared::error_types::DetailedError,
                 > = ::std::vec![e];
                 let response = $response_type::serialize_internal_error();
                 if let ::std::result::Result::Err(e) = ::nix::sys::socket::send(

@@ -3,8 +3,7 @@ use crate::linux::runtime_error::RuntimeError;
 use crate::linux::util::unwrap_or_report_failure;
 use crate::shutdown_signal::{ReloadRequest, ShutdownSignal};
 use crate::{send_all_errors, send_error};
-use garnshared::add_metadata_to_error;
-use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
+use garnshared::error_types::{ResultMetadata, DetailedError};
 use garnshared::welcome_protocol::{WELCOME_REQUEST_PROTOCOL, WelcomeRequest, WelcomeResponse};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::eventfd::{EfdFlags, EventFd};
@@ -23,7 +22,7 @@ use std::sync::{
 
 #[allow(clippy::needless_pass_by_value)] // This function should take ownership over the welcome socket, it's part of the semantics
 pub fn welcome_thread_main(
-    error_tx: &Sender<SendableErrorWithMetadata>,
+    error_tx: &Sender<DetailedError>,
     welcome_socket: OwnedFd,
     shutdown_event: &Arc<EventFd>,
     reload_event: &Arc<EventFd>,
@@ -75,7 +74,7 @@ pub fn welcome_thread_main(
                 .read()
                 .add_metadata()
                 .map_or_else(|e| send_error!(error_tx, e), |_| ());
-            send_error!(error_tx, add_metadata_to_error!(ShutdownSignal {}));
+            send_error!(error_tx, DetailedError::add_metadata(ShutdownSignal {}));
             return;
         }
 
@@ -85,7 +84,7 @@ pub fn welcome_thread_main(
                 .read()
                 .add_metadata()
                 .map_or_else(|e| send_error!(error_tx, e), |_| ());
-            send_error!(error_tx, add_metadata_to_error!(ReloadRequest {}));
+            send_error!(error_tx, DetailedError::add_metadata(ReloadRequest {}));
             return;
         }
 
@@ -104,7 +103,7 @@ pub fn welcome_thread_main(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        send_error!(error_tx, add_metadata_to_error!(TryRecvError::Disconnected));
+                        send_error!(error_tx, DetailedError::add_metadata(TryRecvError::Disconnected));
                         return;
                     }
                 }
@@ -119,10 +118,10 @@ pub fn welcome_thread_main(
         if !poll_welcome.revents().unwrap().contains(PollFlags::POLLIN) {
             send_error!(
                 error_tx,
-                add_metadata_to_error!(RuntimeError::WelcomeSocketFailed)
+                DetailedError::add_metadata(RuntimeError::WelcomeSocketFailed)
             );
             // We can't possibly recover from this failure => shutdown
-            send_error!(error_tx, add_metadata_to_error!(ShutdownSignal {}));
+            send_error!(error_tx, DetailedError::add_metadata(ShutdownSignal {}));
             continue;
         }
 
@@ -151,7 +150,7 @@ pub fn welcome_thread_main(
 
 fn receive_and_parse_request(
     welcome_socket: BorrowedFd,
-) -> Result<(OwnedFd, WelcomeRequest), Vec<SendableErrorWithMetadata>> {
+) -> Result<(OwnedFd, WelcomeRequest), Vec<DetailedError>> {
     let raw_fd = accept(welcome_socket.as_raw_fd())
         .add_metadata()
         .map_err(|e| vec![e])?;
@@ -164,7 +163,7 @@ fn receive_and_parse_request(
         .add_metadata()
         .map_err(|e| vec![e])?;
     if creds.uid() == 0 {
-        return Err(vec![add_metadata_to_error!(IgnoredRootRequestError {})]);
+        return Err(vec![DetailedError::add_metadata(IgnoredRootRequestError {})]);
     }
 
     let mut buffer = vec![0u8; WELCOME_REQUEST_PROTOCOL.max_size()].into_boxed_slice();
@@ -215,11 +214,11 @@ fn receive_and_parse_request(
 fn handle_open_environment(
     env_name: &str,
     environments: &mut HashMap<String, Environment>,
-    error_tx: &Sender<SendableErrorWithMetadata>,
+    error_tx: &Sender<DetailedError>,
     client_fd: OwnedFd,
     close_env_event: &Arc<EventFd>,
     close_env_tx: &Sender<String>,
-) -> Result<(), Vec<SendableErrorWithMetadata>> {
+) -> Result<(), Vec<DetailedError>> {
     let passed_off_fd = unwrap_or_report_failure!(
         nix::unistd::dup(client_fd.as_fd()).add_metadata(),
         client_fd.as_raw_fd(),

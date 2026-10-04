@@ -5,7 +5,7 @@ use crate::util::error_in_brittle_scenario;
 use crate::{constants, send_error};
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
-use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
+use garnshared::error_types::{ResultMetadata, DetailedError};
 use nix::errno::Errno as NixErrno;
 use nix::libc;
 use nix::libc::_exit;
@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::{fs, thread};
-use garnshared::add_metadata_to_error;
 
 /// Only used for the termination and reload signal handlers, NOWHERE ELSE!
 /// # SAFETY
@@ -31,14 +30,14 @@ static mut SHUTDOWN_EVENT_FOR_SIGNAL: c_int = -1;
 static mut RELOAD_EVENT_FOR_SIGNAL: c_int = -1;
 
 pub struct Runtime<S: State> {
-    error_tx: Sender<SendableErrorWithMetadata>,
+    error_tx: Sender<DetailedError>,
     working_dir_path: PathBuf,
     state_data: S,
 }
 
 impl Runtime<Uninit> {
-    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<SendableErrorWithMetadata>) {
-        let (tx, rx) = mpsc::channel::<SendableErrorWithMetadata>();
+    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<DetailedError>) {
+        let (tx, rx) = mpsc::channel::<DetailedError>();
         let working_dir_path =
             Path::new(working_dir_name.unwrap_or(garnshared::constants::WORKING_DIR)).to_path_buf();
 
@@ -52,7 +51,7 @@ impl Runtime<Uninit> {
         )
     }
 
-    pub fn init(self) -> Result<Runtime<Ready>, SendableErrorWithMetadata> {
+    pub fn init(self) -> Result<Runtime<Ready>, DetailedError> {
         self.check_privileges()?;
 
         self.setup_working_dir()?;
@@ -71,10 +70,10 @@ impl Runtime<Uninit> {
     }
 
     #[allow(clippy::similar_names)] // uid and gid being similar is fine
-    fn check_privileges(&self) -> Result<(), SendableErrorWithMetadata> {
+    fn check_privileges(&self) -> Result<(), DetailedError> {
         cfg_if! {
             if #[cfg(debug_assertions)] {
-                send_error!(self.error_tx, add_metadata_to_error!(RuntimeError::PrivilegeChecksDisabled));
+                send_error!(self.error_tx, DetailedError::add_metadata(RuntimeError::PrivilegeChecksDisabled));
                 return Ok(());
             }
         }
@@ -144,7 +143,7 @@ impl Runtime<Uninit> {
         Ok(())
     }
 
-    fn setup_working_dir(&self) -> Result<(), SendableErrorWithMetadata> {
+    fn setup_working_dir(&self) -> Result<(), DetailedError> {
         let working_dir_str = self
             .working_dir_path
             .clone()
@@ -209,7 +208,7 @@ impl Runtime<Uninit> {
         Ok(())
     }
 
-    fn setup_socket() -> Result<(OwnedFd, EventFd, EventFd), SendableErrorWithMetadata> {
+    fn setup_socket() -> Result<(OwnedFd, EventFd, EventFd), DetailedError> {
         let welcome_socket = socket(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -249,7 +248,7 @@ impl Runtime<Uninit> {
 }
 
 impl Runtime<Ready> {
-    pub fn listen(self) -> Result<Runtime<Listening>, SendableErrorWithMetadata> {
+    pub fn listen(self) -> Result<Runtime<Listening>, DetailedError> {
         // Setup signal handlers for graceful shutdown and reload
         // Safety: This is the only write to the statics before the signal handlers are installed.
         unsafe {

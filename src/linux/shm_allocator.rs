@@ -1,7 +1,7 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
 use crate::util::error_in_brittle_scenario;
-use garnshared::error_types::{ResultMetadata, SendableErrorWithMetadata};
+use garnshared::error_types::{ResultMetadata, DetailedError};
 use garnshared::linux::traits::ShmCompatible;
 use hashed_type_def::HashedTypeMethods;
 use nix::fcntl::{FcntlArg, SealFlag, fcntl};
@@ -47,7 +47,7 @@ pub struct ShmAllocator {
 }
 
 impl ShmAllocator {
-    pub fn new() -> Result<Self, SendableErrorWithMetadata> {
+    pub fn new() -> Result<Self, DetailedError> {
         let page_size = match sysconf(SysconfVar::PAGE_SIZE).add_metadata() {
             Ok(Some(0) | None) => return Err(RuntimeError::GetPageSizeFailed).add_metadata(),
             Ok(Some(res)) => usize::try_from(res).unwrap(), // non-negative according to the Linux kernel
@@ -66,10 +66,10 @@ impl ShmAllocator {
         &mut self,
         name: &str,
         placement_constructor: F,
-    ) -> Result<ClientResourceLocation, SendableErrorWithMetadata>
+    ) -> Result<ClientResourceLocation, DetailedError>
     where
         T: ShmCompatible,
-        F: FnOnce(Pin<&mut MaybeUninit<T>>) -> Result<(), SendableErrorWithMetadata>,
+        F: FnOnce(Pin<&mut MaybeUninit<T>>) -> Result<(), DetailedError>,
     {
         if self.resources.contains_key(name) {
             return Err(RuntimeError::ResourceNameAlreadyInUse {
@@ -162,7 +162,7 @@ impl ShmAllocator {
     pub fn find_resource<T: ShmCompatible>(
         &self,
         name: &str,
-    ) -> Result<Option<ClientResourceLocation>, SendableErrorWithMetadata> {
+    ) -> Result<Option<ClientResourceLocation>, DetailedError> {
         let Some(resource_metadata) = self.resources.get(name) else {
             return Ok(None);
         };
@@ -179,7 +179,7 @@ impl ShmAllocator {
         }))
     }
 
-    fn create_new_page(&mut self) -> Result<(), SendableErrorWithMetadata> {
+    fn create_new_page(&mut self) -> Result<(), DetailedError> {
         let shm_fd = memfd_create(
             constants::SHM_FILE_NAME,
             MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
