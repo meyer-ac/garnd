@@ -16,12 +16,12 @@ use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
 use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::thread;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicI32, Ordering};
 
 /// Only used for the termination and reload signal handlers, NOWHERE ELSE!
 static SHUTDOWN_EVENT_FOR_SIGNAL: AtomicI32 = AtomicI32::new(-1);
@@ -52,15 +52,16 @@ impl Runtime<Uninit> {
     pub fn init(self) -> Result<Runtime<Ready>, DetailedError> {
         self.check_privileges()?;
 
-        let (welcome_socket, shutdown_event, reload_event) = Self::setup_socket()?;
+        let welcome_socket = Self::setup_socket()?;
+        let (shutdown_event, reload_event) = Self::setup_events()?;
 
         Ok(Runtime {
             error_tx: self.error_tx,
             working_dir_path: self.working_dir_path,
             state_data: Ready {
                 welcome_socket,
-                shutdown_event: Arc::new(shutdown_event),
-                reload_event: Arc::new(reload_event),
+                shutdown_event,
+                reload_event,
             },
         })
     }
@@ -139,7 +140,7 @@ impl Runtime<Uninit> {
         Ok(())
     }
 
-    fn setup_socket() -> Result<(OwnedFd, EventFd, EventFd), DetailedError> {
+    fn setup_socket() -> Result<OwnedFd, DetailedError> {
         let welcome_socket = socket(
             AddressFamily::Unix,
             SockType::SeqPacket,
@@ -164,26 +165,41 @@ impl Runtime<Uninit> {
             };
         }
 
-        let shutdown_event = EventFd::from_value_and_flags(
-            0,
-            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
-        ).add_metadata()?;
-
-        let reload_event = EventFd::from_value_and_flags(
-            0,
-            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
-        ).add_metadata()?;
-
-        Ok((welcome_socket, shutdown_event, reload_event))
+        Ok(welcome_socket)
     }
-}
 
-impl Runtime<Ready> {
-    pub fn listen(self) -> Result<Runtime<Listening>, DetailedError> {
+    fn setup_events() -> Result<(&'static EventFd, &'static EventFd), DetailedError> {
+        // We recycle already existing `eventfd`s in order to preserve reload and shutdown requests
+        // across reloads. The cost of creating new `eventfd`s for the atomic exchanges on every
+        // reload is acceptable (definitely not a hot path).
+        let mut shutdown_event = EventFd::from_value_and_flags(
+            0,
+            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+        ).add_metadata()?;
+
+        let mut reload_event = EventFd::from_value_and_flags(
+            0,
+            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
+        ).add_metadata()?;
+
+        if let Err(raw_fd) = SHUTDOWN_EVENT_FOR_SIGNAL.compare_exchange(-1i32, shutdown_event.as_raw_fd(), Ordering::Relaxed, Ordering::Relaxed) {
+            // SAFETY: from_raw_fd: raw_fd is a valid fd and will be subsequently leaked => no ownership is taken permanently
+            // from_owned_fd: raw_fd is an EventFd
+            shutdown_event = unsafe { EventFd::from_owned_fd(OwnedFd::from_raw_fd(raw_fd)) }
+        }
+
+        if let Err(raw_fd) = RELOAD_EVENT_FOR_SIGNAL.compare_exchange(-1i32, reload_event.as_raw_fd(), Ordering::Relaxed, Ordering::Relaxed) {
+            // SAFETY: from_raw_fd: raw_fd is a valid fd and will be subsequently leaked => no ownership is taken permanently
+            // from_owned_fd: raw_fd is an EventFd
+            reload_event = unsafe { EventFd::from_owned_fd(OwnedFd::from_raw_fd(raw_fd)) }
+        }
+
+        let shutdown_event = Box::leak(Box::new(shutdown_event));
+        let reload_event = Box::leak(Box::new(reload_event));
+
+        compiler_fence(Ordering::Release);
+
         // Setup signal handlers for graceful shutdown and reload
-        // Safety: This is the only write to the statics before the signal handlers are installed.
-        SHUTDOWN_EVENT_FOR_SIGNAL.store(self.state_data.shutdown_event.as_raw_fd(), Ordering::Release);
-        RELOAD_EVENT_FOR_SIGNAL.store(self.state_data.reload_event.as_raw_fd(), Ordering::Relaxed);
         // Safety: The signal handlers are async safe.
         unsafe {
             sigaction(
@@ -216,26 +232,7 @@ impl Runtime<Ready> {
             )
         }.add_metadata()?;
 
-        // Ownership of the socket is moved into the thread and handed back once the threads join.
-        let error_tx = self.error_tx.clone();
-        let welcome_socket = self.state_data.welcome_socket;
-        let shutdown_event = Arc::clone(&self.state_data.shutdown_event);
-        let reload_event = Arc::clone(&self.state_data.reload_event);
-        //let welcome_thread = thread::spawn(move || {
-        //    welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
-        //});
-        let welcome_thread = JoinGuard::from(thread::Builder::new().spawn(move || {
-            welcome_thread::welcome_thread_main(&error_tx, welcome_socket, &shutdown_event, &reload_event);
-        }).add_metadata()?);
-
-        Ok(Runtime {
-            error_tx: self.error_tx,
-            working_dir_path: self.working_dir_path,
-            state_data: Listening {
-                _welcome_thread: welcome_thread,
-                shutdown_event: self.state_data.shutdown_event,
-            },
-        })
+        Ok((shutdown_event, reload_event))
     }
 
     /// This function is async safe.
@@ -250,6 +247,7 @@ impl Runtime<Ready> {
 
     /// This function is async safe
     extern "C" fn termination_or_reload_handler(is_reload: bool) {
+        compiler_fence(Ordering::Acquire);
         let fd;
         if is_reload {
             // Safety: static read operation backed by static's safety invariant;
@@ -289,31 +287,42 @@ impl Runtime<Ready> {
     }
 }
 
+impl Runtime<Ready> {
+    pub fn listen(self) -> Result<Runtime<Listening>, DetailedError> {
+        // Ownership of the socket is moved into the thread and handed back once the threads join.
+        let error_tx = self.error_tx.clone();
+        let welcome_socket = self.state_data.welcome_socket;
+        let shutdown_event = self.state_data.shutdown_event;
+        let reload_event = self.state_data.reload_event;
+        //let welcome_thread = thread::spawn(move || {
+        //    welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
+        //});
+        let welcome_thread = JoinGuard::from(thread::Builder::new().spawn(move || {
+            welcome_thread::welcome_thread_main(&error_tx, welcome_socket, shutdown_event, reload_event);
+        }).add_metadata()?);
+
+        Ok(Runtime {
+            error_tx: self.error_tx,
+            working_dir_path: self.working_dir_path,
+            state_data: Listening {
+                _welcome_thread: welcome_thread,
+            },
+        })
+    }
+}
+
 pub trait State {}
 pub struct Uninit {}
 pub struct Ready {
     welcome_socket: OwnedFd,
-    shutdown_event: Arc<EventFd>,
-    reload_event: Arc<EventFd>,
+    // References are stored because the fds are leaked to survive reloads and only get destroyed on exit
+    shutdown_event: &'static EventFd,
+    reload_event: &'static EventFd,
 }
 pub struct Listening {
     _welcome_thread: JoinGuard,
-    shutdown_event: Arc<EventFd>,
 }
 
 impl State for Uninit {}
 impl State for Ready {}
 impl State for Listening {}
-
-impl Drop for Listening {
-    fn drop(&mut self) {
-        let result = self.shutdown_event.write(1);
-        if let Err(e) = &result {
-            if thread::panicking() {
-                error_in_brittle_scenario(format!("signaling welcome thread failed: {e}").as_str());
-                return;
-            }
-            result.unwrap();
-        }
-    }
-}

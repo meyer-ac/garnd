@@ -24,8 +24,8 @@ use std::sync::{
 pub fn welcome_thread_main(
     error_tx: &Sender<DetailedError>,
     welcome_socket: OwnedFd,
-    shutdown_event: &Arc<EventFd>,
-    reload_event: &Arc<EventFd>,
+    shutdown_event: &'static EventFd,
+    reload_event: &'static EventFd,
 ) {
     // Initialization
     let mut environments = HashMap::new();
