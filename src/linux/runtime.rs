@@ -34,22 +34,17 @@ pub struct Runtime<S: State> {
 }
 
 impl Runtime<Uninit> {
-    pub fn error_return_code() -> i32 {
-        1
-    }
-    
-    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Sender<DetailedError>, mpsc::Receiver<DetailedError>) {
+    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<DetailedError>) {
         let (tx, rx) = mpsc::channel::<DetailedError>();
         let working_dir_path =
             Path::new(working_dir_name.unwrap_or(garnshared::constants::WORKING_DIR)).to_path_buf();
 
         (
             Self {
-                error_tx: tx.clone(),
+                error_tx: tx,
                 working_dir_path,
                 state_data: Uninit {},
             },
-            tx,
             rx,
         )
     }

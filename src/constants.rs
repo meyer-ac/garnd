@@ -3,6 +3,8 @@ cfg_if::cfg_if! {
         pub const USER_NAME: &str = "garnd";
         pub const GROUP_NAME: &str = "garnd";
         pub const SHM_FILE_NAME: &str = "shm";
+        pub const EXIT_CODE_SUCCESS: u8 = 0;
+        pub const EXIT_CODE_FAILURE: u8 = 1;
     }
 }
 

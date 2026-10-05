@@ -6,6 +6,8 @@
     //clippy::cargo
 )]
 
+use std::process::ExitCode;
+use crate::constants::{EXIT_CODE_FAILURE, EXIT_CODE_SUCCESS};
 use crate::shutdown_signal::{ReloadRequest, ShutdownSignal};
 use crate::util::get_optional_env_var;
 
@@ -25,25 +27,26 @@ cfg_if::cfg_if! {
     }
 }
 
-fn main() -> Result<(), std::io::Error> {
+fn main() -> ExitCode {
     let mut reload_requested ;
     loop {
         reload_requested = false;
-        let (runtime, error_tx, error_rx) = Runtime::new(
+        let mut logger = Logger::new();
+        
+        let (runtime, error_rx) = Runtime::new(
             get_optional_env_var(constants::WORKING_DIR_ENV_OPTION).as_deref(), // Custom working directory
         );
 
         if let Err(e) = runtime.notify_system_starting() {
-            send_error!(error_tx, e);
+            logger.log(&e);
+            return ExitCode::from(EXIT_CODE_FAILURE);
         }
-
-        let mut logger = Logger::new();
 
         let runtime = match runtime.init() {
             Ok(res) => res,
             Err(e) => {
                 logger.log(&e);
-                return Err(std::io::Error::from_raw_os_error(Runtime::error_return_code()));
+                return ExitCode::from(EXIT_CODE_FAILURE);
             },
         };
 
@@ -51,25 +54,28 @@ fn main() -> Result<(), std::io::Error> {
             Ok(res) => res,
             Err(e) => {
                 logger.log(&e);
-                return Err(std::io::Error::from_raw_os_error(Runtime::error_return_code()));
+                return ExitCode::from(EXIT_CODE_FAILURE);
             },
         };
 
         if let Err(e) = runtime.notify_system_listening() {
-            send_error!(error_tx, e);
+            logger.log(&e);
+            return ExitCode::from(EXIT_CODE_FAILURE);
         }
 
         while let Ok(err) = error_rx.recv() {
             let mut shutdown = false;
             if err.error().is::<ShutdownSignal>() {
                 if let Err(e) = runtime.notify_system_stopping() {
-                    send_error!(error_tx, e);
+                    logger.log(&e);
+                    // no return here, daemon is shutting down anyway
                 }
                 shutdown = true;
             } else if err.error().is::<ReloadRequest>() {
                 circuit_breaker();
                 if let Err(e) = runtime.notify_system_reloading() {
-                    send_error!(error_tx, e);
+                    logger.log(&e);
+                    // no return here, rather let the daemon survive and start fresh
                 }
                 reload_requested = true;
             }
@@ -91,5 +97,5 @@ fn main() -> Result<(), std::io::Error> {
         }
     }
 
-    Ok(())
+    ExitCode::from(EXIT_CODE_SUCCESS)
 }
