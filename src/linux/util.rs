@@ -45,9 +45,9 @@ pub fn error_in_brittle_scenario(msg: &str) {
     const PRELUDE_LEN: usize = 27;
     unsafe {
         let last_errno = *libc::__errno_location();
-        libc::write(libc::STDOUT_FILENO, PRELUDE as *const libc::c_void, PRELUDE_LEN);
-        libc::write(libc::STDOUT_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
-        libc::write(libc::STDOUT_FILENO, c"\n".as_ptr() as *const libc::c_void, 1);
+        libc::write(libc::STDERR_FILENO, PRELUDE as *const libc::c_void, PRELUDE_LEN);
+        libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::write(libc::STDERR_FILENO, c"\n".as_ptr() as *const libc::c_void, 1);
         *libc::__errno_location() = last_errno;
     }
 }
