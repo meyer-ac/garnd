@@ -13,15 +13,6 @@ pub enum RuntimeError {
     RunWithCapabilities,
     MayObtainNewPrivileges,
     SecureBitsNotSet,
-    WorkingDirPathInvalidString,
-    WorkingDirNonexistent{working_dir: String},
-    WorkingDirNotADirectory{working_dir: String},
-    WorkingDirOwnedByWrongUser{working_dir: String, owner: String},
-    WorkingDirOwnedByWrongGroup{working_dir: String, owner: String},
-    WorkingDirWrongPermissions{working_dir: String, permissions: &'static str},
-    WorkingDirSetUidBitSet{working_dir: String},
-    WorkingDirSetGidBitSet{working_dir: String},
-    WorkingDirStickyBitSet{working_dir: String},
     ServiceAlreadyRunning,
     WelcomeSocketFailed,
     GetPageSizeFailed,
@@ -62,33 +53,6 @@ impl fmt::Display for RuntimeError {
                 f,
                 "service must be run with all secure bits and all locks set except for 'keep_caps'"
             ),
-            Self::WorkingDirPathInvalidString => {
-                write!(f, "working directory path is not a valid UTF8-string")
-            },
-            Self::WorkingDirNonexistent{working_dir} => {
-                write!(f, "working directory (\"{working_dir}\") does not exist")
-            }
-            Self::WorkingDirNotADirectory{working_dir} => {
-                write!(f, "working directory (\"{working_dir}\") is not a directory")
-            }
-            Self::WorkingDirOwnedByWrongUser{working_dir, owner} => {
-                write!(f, "working directory (\"{working_dir}\") is owned by the wrong user (required owner = {}, actual owner = {owner})", constants::USER_NAME)
-            }
-            Self::WorkingDirOwnedByWrongGroup{working_dir, owner} => {
-                write!(f, "working directory (\"{working_dir}\") is owned by the wrong group (required owner = {}, actual owner = {owner})", constants::GROUP_NAME)
-            }
-            Self::WorkingDirWrongPermissions{working_dir, permissions} => {
-                write!(f, "working directory (\"{working_dir}\") has the wrong permissions (required permissions = {})", *permissions)
-            }
-            Self::WorkingDirSetUidBitSet{working_dir} => {
-                write!(f, "working directory (\"{working_dir}\") has the set-uid bit set")
-            }
-            Self::WorkingDirSetGidBitSet{working_dir} => {
-                write!(f, "working directory (\"{working_dir}\") has the set-gid bit set")
-            }
-            Self::WorkingDirStickyBitSet{working_dir} => {
-                write!(f, "working directory (\"{working_dir}\") has the sticky bit set")
-            }
             Self::ServiceAlreadyRunning => write!(
                 f,
                 "service is either already running or another process impersonates it"

@@ -14,14 +14,13 @@ use nix::sys::prctl::get_no_new_privs;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
-use nix::sys::stat::{Mode, SFlag, lstat};
 use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
 use std::ffi::c_int;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
-use std::{fs, thread};
+use std::thread;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Only used for the termination and reload signal handlers, NOWHERE ELSE!
@@ -52,8 +51,6 @@ impl Runtime<Uninit> {
 
     pub fn init(self) -> Result<Runtime<Ready>, DetailedError> {
         self.check_privileges()?;
-
-        self.setup_working_dir()?;
 
         let (welcome_socket, shutdown_event, reload_event) = Self::setup_socket()?;
 
@@ -137,71 +134,6 @@ impl Runtime<Uninit> {
             || secure_bits & libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED == 0
         {
             return Err(RuntimeError::SecureBitsNotSet).add_metadata();
-        }
-
-        Ok(())
-    }
-
-    fn setup_working_dir(&self) -> Result<(), DetailedError> {
-        let working_dir_str = self
-            .working_dir_path
-            .clone()
-            .into_os_string()
-            .into_string()
-            .map_err(|_| RuntimeError::WorkingDirPathInvalidString).add_metadata()?;
-        if !fs::exists(&self.working_dir_path).add_metadata()? {
-            return Err(RuntimeError::WorkingDirNonexistent {
-                working_dir: working_dir_str,
-            }).add_metadata();
-        }
-        let stats = lstat(&self.working_dir_path).add_metadata()?;
-        if !SFlag::from_bits_truncate(stats.st_mode).contains(SFlag::S_IFDIR) {
-            return Err(RuntimeError::WorkingDirNotADirectory {
-                working_dir: working_dir_str,
-            }).add_metadata();
-        }
-
-        cfg_if! {
-            if #[cfg(debug_assertions)] {
-                return Ok(())
-            }
-        }
-
-        #[allow(unreachable_code)] // Only reachable in release mode, intended
-
-        // Verify owner
-        let garn_user = User::from_name(constants::USER_NAME).add_metadata()?
-            .ok_or(Box::new(RuntimeError::UserNonexistent)).add_metadata()?;
-        let garn_group = Group::from_name(constants::GROUP_NAME).add_metadata()?
-            .ok_or(Box::new(RuntimeError::GroupNonexistent)).add_metadata()?;
-        let owner_user = User::from_uid(Uid::from_raw(stats.st_uid)).add_metadata()?.unwrap();
-        let owner_group = Group::from_gid(Gid::from_raw(stats.st_gid)).add_metadata()?.unwrap();
-        if owner_user.uid != garn_user.uid {
-            return Err(RuntimeError::WorkingDirOwnedByWrongUser {
-                working_dir: working_dir_str,
-                owner: owner_user.name,
-            }).add_metadata();
-        }
-        if owner_group.gid != garn_group.gid {
-            return Err(RuntimeError::WorkingDirOwnedByWrongGroup {
-                working_dir: working_dir_str,
-                owner: owner_group.name,
-            }).add_metadata();
-        }
-
-        // Verify permissions
-        let mode = Mode::from_bits_truncate(stats.st_mode);
-        if !(mode.contains(Mode::S_IRWXU | Mode::S_IRGRP | Mode::S_IXGRP | Mode::S_IROTH | Mode::S_IXOTH) && !mode.contains(Mode::S_IWGRP) && !mode.contains(Mode::S_IWOTH)) {
-            return Err(RuntimeError::WorkingDirWrongPermissions {working_dir: working_dir_str, permissions: "rwxr-xr-x"}).add_metadata();
-        }
-        if mode.contains(Mode::S_ISUID) {
-            return Err(RuntimeError::WorkingDirSetUidBitSet {working_dir: working_dir_str}).add_metadata();
-        }
-        if mode.contains(Mode::S_ISGID) {
-            return Err(RuntimeError::WorkingDirSetGidBitSet {working_dir: working_dir_str}).add_metadata();
-        }
-        if mode.contains(Mode::S_ISVTX) {
-            return Err(RuntimeError::WorkingDirStickyBitSet {working_dir: working_dir_str}).add_metadata();
         }
 
         Ok(())

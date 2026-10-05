@@ -6,7 +6,6 @@
     //clippy::cargo
 )]
 
-use crate::early_failure::early_failure;
 use crate::shutdown_signal::{ReloadRequest, ShutdownSignal};
 use crate::util::get_optional_env_var;
 
@@ -32,17 +31,23 @@ fn main() {
         let (runtime, error_receiver) = Runtime::new(
             get_optional_env_var(constants::WORKING_DIR_ENV_OPTION).as_deref(), // Custom working directory
         );
+        let mut logger = Logger::new();
 
         let runtime = match runtime.init() {
             Ok(res) => res,
-            Err(e) => early_failure(&e.to_string()),
+            Err(e) => {
+                logger.log(&e);
+                return;
+            },
         };
 
-        let mut logger = Logger::new();
-
-        let runtime = runtime
-            .listen()
-            .unwrap_or_else(|e| early_failure(&e.to_string()));
+        let runtime = match runtime.listen() {
+            Ok(res) => res,
+            Err(e) => {
+                logger.log(&e);
+                return;
+            },
+        };
 
         while let Ok(err) = error_receiver.recv() {
             let mut shutdown = false;
