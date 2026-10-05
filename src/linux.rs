@@ -6,3 +6,4 @@ mod shm_allocator;
 pub mod util;
 mod welcome_thread;
 pub mod logger;
+pub mod circuit_breaker;

@@ -21,6 +21,7 @@ cfg_if::cfg_if! {
         use linux::runtime::Runtime;
         use linux::logger::Logger;
         use linux::util::error_in_brittle_scenario;
+        use linux::circuit_breaker::circuit_breaker;
     }
 }
 
@@ -54,6 +55,7 @@ fn main() {
             if err.error().is::<ShutdownSignal>() {
                 shutdown = true;
             } else if err.error().is::<ReloadRequest>() {
+                circuit_breaker();
                 reload_requested = true;
             }
             logger.log(&err);

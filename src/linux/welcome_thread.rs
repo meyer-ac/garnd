@@ -38,6 +38,7 @@ pub fn welcome_thread_main(
             Ok(res) => res,
             Err(e) => {
                 send_error!(error_tx, e);
+                send_error!(error_tx, DetailedError::add_metadata(ReloadRequest {}));
                 return;
             }
         },
@@ -48,6 +49,7 @@ pub fn welcome_thread_main(
 
     if let Err(e) = listen(&welcome_socket.as_fd(), Backlog::MAXCONN).add_metadata() {
         send_error!(error_tx, e);
+        send_error!(error_tx, DetailedError::add_metadata(ReloadRequest {}));
         return;
     }
 
@@ -63,6 +65,7 @@ pub fn welcome_thread_main(
 
         if let Err(e) = poll(poll_fds, PollTimeout::NONE).add_metadata() {
             send_error!(error_tx, e);
+            send_error!(error_tx, DetailedError::add_metadata(ReloadRequest {}));
             return;
         }
 
@@ -104,7 +107,8 @@ pub fn welcome_thread_main(
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         send_error!(error_tx, DetailedError::add_metadata(TryRecvError::Disconnected));
-                        return;
+                        #[allow(clippy::needless_continue)] // for clarity
+                        continue;
                     }
                 }
             }

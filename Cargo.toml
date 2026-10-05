@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 cfg-if = "1.0.4"
-nix = { version = "0.31.3", features = ["user", "fs", "process", "mman", "socket", "event", "uio", "signal"] }
+nix = { version = "0.31.3", features = ["user", "fs", "process", "mman", "socket", "event", "uio", "signal", "time"] }
 caps = "0.5.6"
 errno = "0.3.14"
 hashed-type-def = "0.1.2"
