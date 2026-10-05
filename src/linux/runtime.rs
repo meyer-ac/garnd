@@ -1,11 +1,11 @@
 use super::runtime_error::RuntimeError;
+use crate::error_in_brittle_scenario;
 use crate::join_guard::JoinGuard;
 use crate::linux::welcome_thread;
-use crate::error_in_brittle_scenario;
 use crate::{constants, send_error};
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
-use garnshared::error_types::{ResultMetadata, DetailedError};
+use garnshared::error_types::{DetailedError, ResultMetadata};
 use nix::errno::Errno as NixErrno;
 use nix::libc;
 use nix::libc::_exit;
@@ -14,14 +14,14 @@ use nix::sys::prctl::get_no_new_privs;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use nix::sys::socket::sockopt::PassCred;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, setsockopt, socket};
-use nix::unistd::{Gid, Group, Uid, User, getgroups, getresgid, getresuid, setfsgid, setfsuid};
+use nix::unistd::{getgroups, getpid, getresgid, getresuid, setfsgid, setfsuid, Gid, Group, Uid, User};
 use std::ffi::c_int;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicI32, Ordering, compiler_fence};
 use std::sync::mpsc;
+use std::sync::mpsc::Sender;
 use std::thread;
-use std::sync::atomic::{compiler_fence, AtomicI32, Ordering};
 
 /// Only used for the termination and reload signal handlers, NOWHERE ELSE!
 static SHUTDOWN_EVENT_FOR_SIGNAL: AtomicI32 = AtomicI32::new(-1);
@@ -34,19 +34,31 @@ pub struct Runtime<S: State> {
 }
 
 impl Runtime<Uninit> {
-    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Receiver<DetailedError>) {
+    pub fn error_return_code() -> i32 {
+        1
+    }
+    
+    pub fn new(working_dir_name: Option<&str>) -> (Self, mpsc::Sender<DetailedError>, mpsc::Receiver<DetailedError>) {
         let (tx, rx) = mpsc::channel::<DetailedError>();
         let working_dir_path =
             Path::new(working_dir_name.unwrap_or(garnshared::constants::WORKING_DIR)).to_path_buf();
 
         (
             Self {
-                error_tx: tx,
+                error_tx: tx.clone(),
                 working_dir_path,
                 state_data: Uninit {},
             },
+            tx,
             rx,
         )
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn notify_system_starting(&self) -> Result<(), DetailedError> {
+        systemd::daemon::notify(false, [("STATUS", "Starting service..."), ("MAINPID", &getpid().to_string())].iter())
+            .map(|_| ())
+            .add_metadata()
     }
 
     pub fn init(self) -> Result<Runtime<Ready>, DetailedError> {
@@ -75,8 +87,10 @@ impl Runtime<Uninit> {
             }
         }
         #[allow(unreachable_code)] // Only unreachable in debug mode, which is intended
-        let garn_user = User::from_name(constants::USER_NAME).add_metadata()?
-            .ok_or(Box::new(RuntimeError::UserNonexistent)).add_metadata()?;
+        let garn_user = User::from_name(constants::USER_NAME)
+            .add_metadata()?
+            .ok_or(Box::new(RuntimeError::UserNonexistent))
+            .add_metadata()?;
         let res_uid = getresuid().add_metadata()?;
         if res_uid.real != garn_user.uid
             || res_uid.effective != garn_user.uid
@@ -88,8 +102,10 @@ impl Runtime<Uninit> {
             return Err(RuntimeError::RunAsWrongUser).add_metadata();
         }
 
-        let garn_group = Group::from_name(constants::GROUP_NAME).add_metadata()?
-            .ok_or(Box::new(RuntimeError::GroupNonexistent)).add_metadata()?;
+        let garn_group = Group::from_name(constants::GROUP_NAME)
+            .add_metadata()?
+            .ok_or(Box::new(RuntimeError::GroupNonexistent))
+            .add_metadata()?;
         let res_gid = getresgid().add_metadata()?;
         if res_gid.real != garn_group.gid
             || res_gid.effective != garn_group.gid
@@ -146,7 +162,8 @@ impl Runtime<Uninit> {
             SockType::SeqPacket,
             SockFlag::SOCK_CLOEXEC,
             None,
-        ).add_metadata()?;
+        )
+        .add_metadata()?;
 
         setsockopt(&welcome_socket.as_fd(), PassCred, &true).add_metadata()?;
 
@@ -172,23 +189,31 @@ impl Runtime<Uninit> {
         // We recycle already existing `eventfd`s in order to preserve reload and shutdown requests
         // across reloads. The cost of creating new `eventfd`s for the atomic exchanges on every
         // reload is acceptable (definitely not a hot path).
-        let mut shutdown_event = EventFd::from_value_and_flags(
-            0,
-            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
-        ).add_metadata()?;
+        let mut shutdown_event =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .add_metadata()?;
 
-        let mut reload_event = EventFd::from_value_and_flags(
-            0,
-            EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK,
-        ).add_metadata()?;
+        let mut reload_event =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .add_metadata()?;
 
-        if let Err(raw_fd) = SHUTDOWN_EVENT_FOR_SIGNAL.compare_exchange(-1i32, shutdown_event.as_raw_fd(), Ordering::Relaxed, Ordering::Relaxed) {
+        if let Err(raw_fd) = SHUTDOWN_EVENT_FOR_SIGNAL.compare_exchange(
+            -1i32,
+            shutdown_event.as_raw_fd(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             // SAFETY: from_raw_fd: raw_fd is a valid fd and will be subsequently leaked => no ownership is taken permanently
             // from_owned_fd: raw_fd is an EventFd
             shutdown_event = unsafe { EventFd::from_owned_fd(OwnedFd::from_raw_fd(raw_fd)) }
         }
 
-        if let Err(raw_fd) = RELOAD_EVENT_FOR_SIGNAL.compare_exchange(-1i32, reload_event.as_raw_fd(), Ordering::Relaxed, Ordering::Relaxed) {
+        if let Err(raw_fd) = RELOAD_EVENT_FOR_SIGNAL.compare_exchange(
+            -1i32,
+            reload_event.as_raw_fd(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             // SAFETY: from_raw_fd: raw_fd is a valid fd and will be subsequently leaked => no ownership is taken permanently
             // from_owned_fd: raw_fd is an EventFd
             reload_event = unsafe { EventFd::from_owned_fd(OwnedFd::from_raw_fd(raw_fd)) }
@@ -210,7 +235,8 @@ impl Runtime<Uninit> {
                     Signal::SIGTERM | Signal::SIGINT,
                 ),
             )
-        }.add_metadata()?;
+        }
+        .add_metadata()?;
         unsafe {
             sigaction(
                 Signal::SIGINT,
@@ -220,17 +246,19 @@ impl Runtime<Uninit> {
                     Signal::SIGTERM | Signal::SIGINT,
                 ),
             )
-        }.add_metadata()?;
+        }
+        .add_metadata()?;
         unsafe {
             sigaction(
                 Signal::SIGHUP,
                 &SigAction::new(
                     SigHandler::Handler(Self::reload_signal_handler),
                     SaFlags::SA_RESTART,
-                    SigSet::from(Signal::SIGHUP)
+                    SigSet::from(Signal::SIGHUP),
                 ),
             )
-        }.add_metadata()?;
+        }
+        .add_metadata()?;
 
         Ok((shutdown_event, reload_event))
     }
@@ -297,9 +325,18 @@ impl Runtime<Ready> {
         //let welcome_thread = thread::spawn(move || {
         //    welcome_thread::welcome_thread_main(error_tx, welcome_socket, shutdown_event)
         //});
-        let welcome_thread = JoinGuard::from(thread::Builder::new().spawn(move || {
-            welcome_thread::welcome_thread_main(&error_tx, welcome_socket, shutdown_event, reload_event);
-        }).add_metadata()?);
+        let welcome_thread = JoinGuard::from(
+            thread::Builder::new()
+                .spawn(move || {
+                    welcome_thread::welcome_thread_main(
+                        &error_tx,
+                        welcome_socket,
+                        shutdown_event,
+                        reload_event,
+                    );
+                })
+                .add_metadata()?,
+        );
 
         Ok(Runtime {
             error_tx: self.error_tx,
@@ -308,6 +345,29 @@ impl Runtime<Ready> {
                 _welcome_thread: welcome_thread,
             },
         })
+    }
+}
+
+impl Runtime<Listening> {
+    #[allow(clippy::unused_self)]
+    pub fn notify_system_listening(&self) -> Result<(), DetailedError> {
+        systemd::daemon::notify(false, [("READY", "1"), ("STATUS", "Listening...")].iter())
+            .map(|_| ())
+            .add_metadata()
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn notify_system_reloading(&self) -> Result<(), DetailedError> {
+        systemd::daemon::notify(false, [("RELOADING", "1"), ("STATUS", "Reloading service...")].iter())
+            .map(|_| ())
+            .add_metadata()
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn notify_system_stopping(&self) -> Result<(), DetailedError> {
+        systemd::daemon::notify(false, [("STOPPING", "1"), ("STATUS", "Stopping service...")].iter())
+            .map(|_| ())
+            .add_metadata()
     }
 }
 
