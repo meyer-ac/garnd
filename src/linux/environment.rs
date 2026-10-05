@@ -1,6 +1,6 @@
 use crate::join_guard::JoinGuard;
 use crate::linux::environment_synchronization_thread::environment_synchronization_thread_main;
-use crate::util::error_in_brittle_scenario;
+use crate::error_in_brittle_scenario;
 use garnshared::error_types::{ResultMetadata, DetailedError};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::os::fd::OwnedFd;

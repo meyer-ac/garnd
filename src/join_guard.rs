@@ -1,4 +1,4 @@
-use crate::util::error_in_brittle_scenario;
+use crate::error_in_brittle_scenario;
 use std::mem::ManuallyDrop;
 use std::thread;
 use std::thread::JoinHandle;

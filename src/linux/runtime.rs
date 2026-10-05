@@ -1,7 +1,7 @@
 use super::runtime_error::RuntimeError;
 use crate::join_guard::JoinGuard;
 use crate::linux::welcome_thread;
-use crate::util::error_in_brittle_scenario;
+use crate::error_in_brittle_scenario;
 use crate::{constants, send_error};
 use cfg_if::cfg_if;
 use errno::{Errno, errno, set_errno};
@@ -22,12 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::{fs, thread};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Only used for the termination and reload signal handlers, NOWHERE ELSE!
-/// # SAFETY
-/// Each only written to once before the signal handler is installed.
-static mut SHUTDOWN_EVENT_FOR_SIGNAL: c_int = -1;
-static mut RELOAD_EVENT_FOR_SIGNAL: c_int = -1;
+static SHUTDOWN_EVENT_FOR_SIGNAL: AtomicI32 = AtomicI32::new(-1);
+static RELOAD_EVENT_FOR_SIGNAL: AtomicI32 = AtomicI32::new(-1);
 
 pub struct Runtime<S: State> {
     error_tx: Sender<DetailedError>,
@@ -251,11 +250,8 @@ impl Runtime<Ready> {
     pub fn listen(self) -> Result<Runtime<Listening>, DetailedError> {
         // Setup signal handlers for graceful shutdown and reload
         // Safety: This is the only write to the statics before the signal handlers are installed.
-        unsafe {
-            SHUTDOWN_EVENT_FOR_SIGNAL = self.state_data.shutdown_event.as_raw_fd();
-        }unsafe {
-            RELOAD_EVENT_FOR_SIGNAL = self.state_data.reload_event.as_raw_fd();
-        }
+        SHUTDOWN_EVENT_FOR_SIGNAL.store(self.state_data.shutdown_event.as_raw_fd(), Ordering::Release);
+        RELOAD_EVENT_FOR_SIGNAL.store(self.state_data.reload_event.as_raw_fd(), Ordering::Relaxed);
         // Safety: The signal handlers are async safe.
         unsafe {
             sigaction(
@@ -325,7 +321,7 @@ impl Runtime<Ready> {
         let fd;
         if is_reload {
             // Safety: static read operation backed by static's safety invariant;
-            fd = unsafe { RELOAD_EVENT_FOR_SIGNAL };
+            fd = RELOAD_EVENT_FOR_SIGNAL.load(Ordering::Relaxed);
             if fd == -1 {
                 error_in_brittle_scenario(
                     "Reload requested in an early or severely invalid state of the program, continuing.",
@@ -334,7 +330,7 @@ impl Runtime<Ready> {
             }
         } else {
             // Safety: static read operation backed by static's safety invariant;
-            fd = unsafe { SHUTDOWN_EVENT_FOR_SIGNAL };
+            fd = SHUTDOWN_EVENT_FOR_SIGNAL.load(Ordering::Relaxed);
             if fd == -1 {
                 error_in_brittle_scenario(
                     "Termination requested in an early or severely invalid state of the program, exiting.",
@@ -350,11 +346,13 @@ impl Runtime<Ready> {
         // the value written to it is exactly 8 bytes;
         // `write` is async safe.
         unsafe {
+            let last_errno = *libc::__errno_location();
             let _ = libc::write(
                 fd,
                 (&raw const buf).cast::<libc::c_void>(),
                 size_of_val(&buf),
             );
+            *libc::__errno_location() = last_errno;
         }
     }
 }

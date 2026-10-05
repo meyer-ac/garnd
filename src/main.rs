@@ -21,6 +21,7 @@ cfg_if::cfg_if! {
         mod linux;
         use linux::runtime::Runtime;
         use linux::logger::Logger;
+        use linux::util::error_in_brittle_scenario;
     }
 }
 

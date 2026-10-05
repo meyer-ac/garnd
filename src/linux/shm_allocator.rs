@@ -1,6 +1,6 @@
 use super::runtime_error::RuntimeError;
 use crate::constants;
-use crate::util::error_in_brittle_scenario;
+use crate::error_in_brittle_scenario;
 use garnshared::error_types::{ResultMetadata, DetailedError};
 use garnshared::linux::traits::ShmCompatible;
 use hashed_type_def::HashedTypeMethods;
